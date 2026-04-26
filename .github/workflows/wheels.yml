@@ -1,0 +1,137 @@
+# Build CUDA-bundled manylinux wheels for cuhll-cu12 and publish to PyPI
+# on tag.
+#
+# Triggered by:
+#   - git tag v*           -> build wheels and publish to PyPI
+#   - workflow_dispatch    -> manual run, builds wheels but skips publish
+#
+# Build environment:
+#   - The job runs cibuildwheel on ubuntu-24.04, which in turn pulls
+#     NVIDIA's quay.io/pypa/manylinux_2_28_x86_64 image with CUDA toolkit
+#     pre-installed (CUHLL_CIBW_CUDA_IMAGE). cuHLL's CMake stays
+#     identical — only PATH and LD_LIBRARY_PATH inside the container
+#     differ. No GPU is needed at build time.
+#
+# Output:
+#   - cp39 ... cp313 wheels for linux_x86_64, libcudart.so.12 bundled
+#     via auditwheel repair so end users `pip install cuhll-cu12` and
+#     get a working `import cuhll` with only an NVIDIA driver present.
+#
+# Stage-1 scope (per README plan): one platform (linux_x86_64), one
+# CUDA major (12). Stage 2 adds aarch64 and CUDA 13 by duplicating this
+# workflow with different matrix entries.
+
+name: build-wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (true) or only build artifacts (false)"
+        required: true
+        default: "false"
+
+permissions:
+  contents: read
+  # Trusted Publishing to PyPI needs id-token: write on the publish job.
+  # See https://docs.pypi.org/trusted-publishers/.
+
+jobs:
+  build:
+    name: build wheel ${{ matrix.python }} / cu12
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - cp39
+          - cp310
+          - cp311
+          - cp312
+          - cp313
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build wheel via cibuildwheel
+        uses: pypa/cibuildwheel@v2.21.0
+        env:
+          # Only this Python ABI for this matrix entry.
+          CIBW_BUILD: "${{ matrix.python }}-manylinux_x86_64"
+
+          # NVIDIA-supplied manylinux_2_28 + CUDA 12.6 toolkit.
+          # quay.io/pypa/manylinux_2_28_x86_64 doesn't ship CUDA, so we
+          # use NVIDIA's official PyPA-aligned image. Bump the tag when
+          # newer manylinux_2_28 + CUDA images land upstream.
+          CIBW_MANYLINUX_X86_64_IMAGE: nvidia/cuda:12.6.3-devel-ubi8
+          CIBW_BUILD_FRONTEND: pip
+
+          # The wheel is published as plain `cuhll`. Per-CUDA-major
+          # suffixes are deliberately not used; one canonical name.
+          CIBW_ENVIRONMENT: >
+            CMAKE_CUDA_ARCHITECTURES="75;80;86;89;90"
+            CUDA_HOME=/usr/local/cuda
+
+          # auditwheel repair bundles libcudart but MUST exclude
+          # libcuda.so.1 (the driver) and libnvidia-ml — those come
+          # from the user's NVIDIA driver, not the toolkit. Without
+          # the exclude, auditwheel either fails or produces a wheel
+          # that ships a stub libcuda that breaks at runtime.
+          CIBW_REPAIR_WHEEL_COMMAND_LINUX: >
+            auditwheel repair
+            --exclude libcuda.so.1
+            --exclude libnvidia-ml.so.1
+            -w {dest_dir} {wheel}
+
+          # Smoke test: import the wheel inside the manylinux container
+          # (no GPU available, so we only check that the module loads
+          # and reports its version — anything that requires a CUDA
+          # context will fail in the build environment).
+          CIBW_TEST_COMMAND: >
+            python -c "import cuhll; assert cuhll.__version__, 'no version'; print('imported cuhll', cuhll.__version__)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.python }}
+          path: ./wheelhouse/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: build sdist
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build sdist
+        run: |
+          pip install --upgrade build
+          python -m build --sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: ./dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: [build, sdist]
+    runs-on: ubuntu-24.04
+    # Only on real tag pushes (not workflow_dispatch unless explicitly opted in).
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.publish == 'true')
+    permissions:
+      id-token: write     # Trusted Publishing
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: List artifacts to be published
+        run: ls -la dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist/

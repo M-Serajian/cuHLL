@@ -1,0 +1,47 @@
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
+build/
+bench/results/*.csv
+bench/results/*.md
+bench/results/kmc_tmp/
+bench/results/kmc_out/
+tools/kmc3/
+compile_commands.json
+*.o
+*.a
+trashcan/
+*.csv
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.obj
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+*.egg
+.eggs/
+.pytest_cache/
+.hypothesis/
+.tox/
+.venv/
+venv/
+env/
+dist/
+wheels/
+.python-version
+
+# OS / editor scratch
+.DS_Store
+*~
+.*.swp
+.*.swo
+

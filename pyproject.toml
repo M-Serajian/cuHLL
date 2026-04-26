@@ -1,0 +1,150 @@
+# pyproject.toml — Python packaging for cuHLL.
+#
+# Build is driven by scikit-build-core, which invokes the existing
+# CMakeLists.txt (single source of truth for the C++/CUDA build) with
+# CUHLL_BUILD_PYTHON=ON to additionally compile the pybind11 module.
+#
+# Local install (editable):    pip install -e .
+# Local install (wheel):       pip install .
+# Build a wheel for sharing:   pip wheel --no-deps .
+#
+# Distribution to PyPI is a follow-up (cibuildwheel + per-CUDA-major
+# wheel matrix); see the README's "Installing as a Python package"
+# section for the current local-install workflow.
+
+[build-system]
+requires = [
+    "scikit-build-core>=0.10",
+    "pybind11>=2.13",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+# Project name is "cuhll" both in source and on PyPI — `pip install cuhll`
+# is the install command (PyPI is case-insensitive, so `pip install cuHLL`
+# resolves to the same package). Per-CUDA-major suffixes like
+# `cuhll-cu12` are deliberately NOT used; one canonical package name,
+# one wheel matrix.
+name = "cuhll"
+version = "1.0.0"
+description = "CUDA-accelerated HyperLogLog sketches for genomic k-mers"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "M. Serajian" },
+]
+keywords = ["bioinformatics", "hyperloglog", "cuda", "k-mer", "sketch", "cardinality"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    "numpy>=1.20",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=7",
+]
+
+[project.scripts]
+# Console script; available after install. Prints Python/CUDA/GCC/CMake
+# versions, GPU list, and the env vars that influence the build.
+# Run before installing (`python python/cuhll/diagnose.py`) to verify a
+# new machine, or after a failure to attach the output to a bug report.
+cuhll-diagnose = "cuhll.diagnose:main"
+
+[project.urls]
+Homepage      = "https://github.com/M-Serajian/cuHLL"
+Repository    = "https://github.com/M-Serajian/cuHLL"
+Issues        = "https://github.com/M-Serajian/cuHLL/issues"
+
+# -----------------------------------------------------------------------------
+# scikit-build-core configuration
+# -----------------------------------------------------------------------------
+[tool.scikit-build]
+# Reuse the project's existing CMakeLists.txt verbatim; we only flip on the
+# Python-bindings option so the pybind11 module gets built alongside the
+# native targets.
+cmake.version    = ">=3.30"
+cmake.args       = ["-DCUHLL_BUILD_PYTHON=ON"]
+# CUHLL_BUILD_TESTS intentionally not pinned here — its CMake-side
+# default is OFF, so a plain `pip install .` skips the C++ tests.
+# Users opt in via:
+#   pip install ".[test]" --config-settings=cmake.define.CUHLL_BUILD_TESTS=ON
+# Hard-coding -DCUHLL_BUILD_TESTS=OFF here would shadow that flag.
+cmake.build-type = "Release"
+
+# Map the source-tree layout into the wheel.
+wheel.packages   = ["python/cuhll"]
+
+# Per-build-tag scratch dir keeps multi-Python builds from clobbering each
+# other.
+build-dir        = "build/{wheel_tag}"
+
+# We fetch cuCollections / CCCL / pybind11 via CPM at configure time; lock
+# isolation off so users with vendored deps can swap them via env vars
+# (CPM_<name>_SOURCE).
+#
+# build.verbose=true asks Ninja to echo every compiler invocation so that
+# when the user runs `pip install . -v` (or has `pip config set
+# global.verbose 1` for persistent verbose output), failed CUDA / GCC /
+# linker calls are visible in real time. Has no effect when pip itself
+# is in default-quiet mode — pip's buffer is upstream of this flag.
+build.verbose    = true
+
+# Files that pip should regenerate the wheel for when they change.
+sdist.exclude    = [
+    "build/",
+    ".git/",
+    ".vscode/",
+    ".idea/",
+    "*.egg-info/",
+]
+
+[tool.scikit-build.cmake.define]
+CMAKE_BUILD_TYPE = "Release"
+
+# -----------------------------------------------------------------------------
+# pytest configuration (Layer-1 hermetic + Layer-2 KMC mirror in Python)
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths  = ["python/tests"]
+addopts    = "-ra --strict-markers"
+markers    = [
+    "gpu: test requires a CUDA-capable GPU at runtime",
+]
+
+# -----------------------------------------------------------------------------
+# cibuildwheel — local defaults (mirrored / overridden in CI by env vars in
+# .github/workflows/wheels.yml). Settings here let `cibuildwheel --output-dir
+# wheelhouse` work locally if you have Docker available.
+# -----------------------------------------------------------------------------
+[tool.cibuildwheel]
+build         = "cp39-manylinux_x86_64 cp310-manylinux_x86_64 cp311-manylinux_x86_64 cp312-manylinux_x86_64 cp313-manylinux_x86_64"
+build-frontend = "pip"
+test-command  = 'python -c "import cuhll; assert cuhll.__version__"'
+
+[tool.cibuildwheel.linux]
+# NVIDIA's official manylinux_2_28-aligned image with the CUDA 12.6
+# toolkit pre-installed. Avoid pinning to "latest" so wheel reproducibility
+# tracks the tag, not whatever NVIDIA pushed last week.
+manylinux-x86_64-image = "nvidia/cuda:12.6.3-devel-ubi8"
+environment = { CMAKE_CUDA_ARCHITECTURES = "75;80;86;89;90", CUDA_HOME = "/usr/local/cuda" }
+# auditwheel must NOT bundle the driver libs — those come from the user's
+# NVIDIA driver install, never from the wheel. libcudart IS bundled (it's
+# part of the toolkit; users without the toolkit still get a working wheel).
+repair-wheel-command = "auditwheel repair --exclude libcuda.so.1 --exclude libnvidia-ml.so.1 -w {dest_dir} {wheel}"
