@@ -1,17 +1,18 @@
 #pragma once
-// Plain FASTA parser.
+// Sequence parsers — FASTA, FASTQ, and gzipped variants of both.
 //
-//   read_fasta_concat         — whole-file eager read, returned as one string.
-//                                Used by the single-stream fallback path and
-//                                kept for tests that want a small in-memory
-//                                copy of an input.
-//   FastaChunkReader          — streaming chunk reader used by the multi-stream
-//                                pipeline (milestone d). Emits filtered
-//                                sequence bytes with headers stripped and
-//                                whitespace removed; non-ACGT bases pass
-//                                through (kernel handles them as window breaks)
-//                                and intra-file record boundaries are marked
-//                                by injecting a single 'N' into the stream.
+//   read_fasta_concat         — whole-file eager read, returned as one
+//                                string of concatenated bases with 'N'
+//                                injected between records. Auto-detects:
+//                                  * gzip stream (magic 1f 8b)        → decompress
+//                                  * '>' first byte                   → FASTA
+//                                  * '@' first byte                   → FASTQ (4-line)
+//                                The name is historical; FASTQ + .gz are
+//                                handled transparently.
+//   FastaChunkReader          — streaming chunk reader for plain FASTA.
+//                                Used by the single-stream sequential pipeline.
+//                                Headers stripped, whitespace removed,
+//                                intra-file boundaries marked with a single 'N'.
 
 #include <cstddef>
 #include <fstream>

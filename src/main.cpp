@@ -42,28 +42,31 @@ std::string lower(std::string s) {
     return s;
 }
 
-bool has_fasta_ext(const std::string& p) {
-    const auto e = lower(std::filesystem::path(p).extension().string());
-    return e == ".fasta" || e == ".fa" || e == ".fna";
-}
-
-bool has_gzipped_fasta_ext(const std::string& p) {
+// Strip a trailing ".gz" (case-insensitive) and return the inner extension.
+// e.g. "/path/to/foo.fastq.gz" → ".fastq". For non-gzipped paths the
+// path's own extension is returned.
+std::string sequence_inner_ext(const std::string& p) {
     std::filesystem::path pp(p);
-    if (lower(pp.extension().string()) != ".gz") return false;
-    const auto inner = lower(std::filesystem::path(pp.stem()).extension().string());
-    return inner == ".fa" || inner == ".fna" || inner == ".fasta";
+    const auto outer = lower(pp.extension().string());
+    if (outer == ".gz") {
+        return lower(std::filesystem::path(pp.stem()).extension().string());
+    }
+    return outer;
 }
 
-// Validate one input path. Throws for unsupported (e.g. gzipped) or
-// unknown extensions; returns the path otherwise.
+bool has_sequence_ext(const std::string& p) {
+    const auto e = sequence_inner_ext(p);
+    return e == ".fasta" || e == ".fa" || e == ".fna"
+        || e == ".fastq" || e == ".fq";
+}
+
+// Validate one input path. cuhll's reader now transparently handles FASTA,
+// FASTQ, and gzip-compressed variants of both via zlib.
 std::string validate_input(const std::string& path) {
-    if (has_gzipped_fasta_ext(path)) {
-        throw std::runtime_error("compressed FASTA not yet supported; gunzip first: "
-                                 + path);
-    }
-    if (!has_fasta_ext(path)) {
-        throw std::runtime_error("unknown input extension (expected .fasta/.fa/.fna): "
-                                 + path);
+    if (!has_sequence_ext(path)) {
+        throw std::runtime_error(
+            "unknown input extension (expected .fasta/.fa/.fna/.fastq/.fq, "
+            "optionally with .gz): " + path);
     }
     return path;
 }
@@ -155,8 +158,9 @@ void print_usage(const char* prog) {
     std::fprintf(stderr,
         "usage: %s --k <K> [options] <input> [<input> ...]\n"
         "\n"
-        "Inputs: plain FASTA files (*.fasta / *.fa / *.fna). Gzipped FASTA is\n"
-        "not yet supported.\n"
+        "Inputs: FASTA or FASTQ (*.fasta / *.fa / *.fna / *.fastq / *.fq),\n"
+        "        optionally gzip-compressed (*.gz). Format is auto-detected\n"
+        "        from the gzip magic bytes and the first content byte.\n"
         "\n"
         "Options:\n"
         "  --k            k-mer length (required; %d <= k <= %d)\n"

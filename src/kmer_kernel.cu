@@ -18,6 +18,7 @@
 #include "cuHLL/cuda_check.hpp"
 #include "cuHLL/kmer_kernel.cuh"
 #include "cuHLL/nthash.cuh"
+#include "cuHLL/nvtx_util.hpp"
 
 #include <cuda_runtime.h>
 
@@ -147,6 +148,7 @@ void launch_kmer_extract(const char* d_seq,
                          cudaStream_t stream,
                          bool canonical,
                          int* blocks_per_sm_out) {
+    CUHLL_NVTX_RANGE("launch_kmer_extract");
     resolve_grid_once();
     const auto& c = launch_cache();
 

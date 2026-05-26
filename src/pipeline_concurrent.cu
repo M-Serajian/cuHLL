@@ -9,6 +9,7 @@
 #include "cuHLL/fasta.hpp"
 #include "cuHLL/hll_file.hpp"
 #include "cuHLL/kmer_kernel.cuh"
+#include "cuHLL/nvtx_util.hpp"
 #include "cuHLL/sketch.hpp"
 #include "cuHLL/sketch_internal.cuh"
 
@@ -156,6 +157,7 @@ std::uint64_t sketch_per_genome_auto(
         int k,
         int precision_p,
         bool canonical) {
+    CUHLL_NVTX_RANGE("sketch_per_genome_auto");
     if (fasta_paths.empty()) return 0;
 
     // 1. Survey + auto-tune. Log once to stderr.
@@ -219,6 +221,7 @@ std::uint64_t sketch_per_genome_auto(
                 auto item = input_q.pop();
                 if (!item) break;
                 try {
+                    CUHLL_NVTX_RANGE("read_fasta_concat");
                     std::string bases = read_fasta_concat(item->path);
                     ready_q.push({item->idx, item->path, std::move(bases)});
                 } catch (const std::exception& e) {
@@ -291,6 +294,7 @@ std::uint64_t sketch_per_genome_auto(
     };
 
     auto launch_slot = [&](int i, ParsedGenome& pg) {
+        CUHLL_NVTX_RANGE("launch_slot_per_genome");
         auto& sl = slots[i];
         const std::size_t n = pg.bases.size();
         if (n > sl.d_bytes) {
@@ -323,68 +327,71 @@ std::uint64_t sketch_per_genome_auto(
 
     const std::size_t target = fasta_paths.size();
 
-    while (n_completed < target) {
-        // Drain anything completed.
-        bool drained_any = false;
+    // Make queue-close + thread-join + slot-free run on every exit (success
+    // or exception). Without this, a throw from launch_slot leaves the
+    // reader/writer pools blocked and std::vector<thread> aborts.
+    std::uint64_t union_est = 0;
+    auto teardown = [&]() noexcept {
+        ready_q.close();
+        write_q.close();
+        for (auto& t : readers) { if (t.joinable()) t.join(); }
+        for (auto& t : writers) { if (t.joinable()) t.join(); }
         for (int i = 0; i < n_streams; ++i) {
-            if (drain_slot(i)) drained_any = true;
+            auto& sl = slots[i];
+            if (sl.done_event) cudaEventDestroy(sl.done_event);
+            if (sl.stream)     cudaStreamDestroy(sl.stream);
+            if (sl.d_input)    cudaFree(sl.d_input);
+            if (sl.h_input)    cudaFreeHost(sl.h_input);
+            if (sl.h_regs)     cudaFreeHost(sl.h_regs);
+            sl.done_event = nullptr; sl.stream = nullptr;
+            sl.d_input = nullptr; sl.h_input = nullptr; sl.h_regs = nullptr;
+        }
+    };
+
+    try {
+        while (n_completed < target) {
+            bool drained_any = false;
+            for (int i = 0; i < n_streams; ++i) {
+                if (drain_slot(i)) drained_any = true;
+            }
+
+            int free_slot = -1;
+            for (int i = 0; i < n_streams; ++i) {
+                if (!slots[i].busy) { free_slot = i; break; }
+            }
+            if (free_slot >= 0 && n_launched < target) {
+                auto pg = ready_q.pop();
+                if (!pg) break;
+                launch_slot(free_slot, *pg);
+                continue;
+            }
+
+            if (!drained_any && free_slot < 0) {
+                int pick = 0;
+                CUDA_CHECK(cudaEventSynchronize(slots[pick].done_event));
+                drain_slot(pick);
+            }
         }
 
-        // If there's free slots AND parsed work, launch.
-        int free_slot = -1;
-        for (int i = 0; i < n_streams; ++i) {
-            if (!slots[i].busy) { free_slot = i; break; }
-        }
-        if (free_slot >= 0 && n_launched < target) {
-            auto pg = ready_q.pop();
-            if (!pg) break; // readers all exited unexpectedly
-            launch_slot(free_slot, *pg);
-            continue;
+        if (reader_fault.load()) {
+            throw std::runtime_error(
+                "cuHLL concurrent: reader failed: " + reader_error);
         }
 
-        // All slots busy; spin-wait briefly on events, then retry. Use
-        // event-sync on the oldest busy slot to avoid busy-polling.
-        if (!drained_any && free_slot < 0) {
-            // Block until ANY event completes. cudaEventSynchronize on
-            // slot 0 is safe — if 0 isn't done, it's at least waiting for
-            // its own kernel, which is fine.
-            int pick = 0;
-            CUDA_CHECK(cudaEventSynchronize(slots[pick].done_event));
-            drain_slot(pick);
+        for (std::size_t i = 0; i < fasta_paths.size(); ++i) {
+            std::printf("%s\t%llu\n", fasta_paths[i].c_str(),
+                        static_cast<unsigned long long>(per_genome_est[i]));
         }
+
+        Sketch union_sketch(precision_p, canonical);
+        union_sketch.load_registers_from_host(union_regs.data());
+        union_est = union_sketch.estimate();
+    } catch (...) {
+        teardown();
+        throw;
     }
 
-    ready_q.close();
-    write_q.close();
-    for (auto& t : readers) t.join();
-    for (auto& t : writers) t.join();
-
-    if (reader_fault.load()) {
-        throw std::runtime_error("cuHLL concurrent: reader failed: " + reader_error);
-    }
-
-    // 7. Emit per-genome estimates in input order.
-    for (std::size_t i = 0; i < fasta_paths.size(); ++i) {
-        std::printf("%s\t%llu\n", fasta_paths[i].c_str(),
-                    static_cast<unsigned long long>(per_genome_est[i]));
-    }
-
-    // 8. Union estimate. Load the accumulated register array into a fresh
-    //    Sketch on GPU and call estimate() — reuses cuco's finalizer.
-    Sketch union_sketch(precision_p, canonical);
-    union_sketch.load_registers_from_host(union_regs.data());
-    const std::uint64_t union_est = union_sketch.estimate();
-
-    // 9. Teardown.
-    for (int i = 0; i < n_streams; ++i) {
-        auto& sl = slots[i];
-        if (sl.done_event) cudaEventDestroy(sl.done_event);
-        if (sl.stream)     cudaStreamDestroy(sl.stream);
-        if (sl.d_input)    cudaFree(sl.d_input);
-        if (sl.h_input)    cudaFreeHost(sl.h_input);
-        if (sl.h_regs)     cudaFreeHost(sl.h_regs);
-    }
-
+    teardown();
     return union_est;
 }
 
@@ -410,6 +417,7 @@ std::uint64_t union_estimate_auto(
         int k,
         int precision_p,
         bool canonical) {
+    CUHLL_NVTX_RANGE("union_estimate_auto");
     if (fasta_paths.empty()) return 0;
 
     InputSurvey survey = survey_inputs(fasta_paths);
@@ -454,6 +462,7 @@ std::uint64_t union_estimate_auto(
                 auto item = input_q.pop();
                 if (!item) break;
                 try {
+                    CUHLL_NVTX_RANGE("read_fasta_concat");
                     std::string bases = read_fasta_concat(item->path);
                     ready_q.push({item->idx, item->path, std::move(bases)});
                 } catch (const std::exception& e) {
@@ -480,6 +489,7 @@ std::uint64_t union_estimate_auto(
     };
 
     auto launch_slot = [&](int i, ParsedGenome& pg) {
+        CUHLL_NVTX_RANGE("launch_slot_union");
         auto& sl = slots[i];
         const std::size_t n = pg.bases.size();
         if (n > d_buf_bytes) {
@@ -499,50 +509,67 @@ std::uint64_t union_estimate_auto(
         ++n_launched;
     };
 
-    while (n_completed < target) {
-        bool drained_any = false;
+    // Make the reader join + slot teardown happen exactly once, on every
+    // exit path (success or exception). Without this, an exception from
+    // launch_slot leaves the reader threads blocked on ready_q.push() and
+    // the std::vector<thread> destructor aborts the process.
+    std::uint64_t union_est = 0;
+    auto teardown = [&]() noexcept {
+        ready_q.close();
+        for (auto& t : readers) {
+            if (t.joinable()) t.join();
+        }
         for (int i = 0; i < n_streams; ++i) {
-            if (drain_slot(i)) drained_any = true;
+            auto& sl = slots[i];
+            if (sl.done)   cudaEventDestroy(sl.done);
+            if (sl.stream) cudaStreamDestroy(sl.stream);
+            if (sl.d_in)   cudaFree(sl.d_in);
+            if (sl.h_in)   cudaFreeHost(sl.h_in);
+            sl.done = nullptr; sl.stream = nullptr;
+            sl.d_in = nullptr; sl.h_in = nullptr;
+        }
+    };
+
+    try {
+        while (n_completed < target) {
+            bool drained_any = false;
+            for (int i = 0; i < n_streams; ++i) {
+                if (drain_slot(i)) drained_any = true;
+            }
+
+            int free_slot = -1;
+            for (int i = 0; i < n_streams; ++i) {
+                if (!slots[i].busy) { free_slot = i; break; }
+            }
+            if (free_slot >= 0 && n_launched < target) {
+                auto pg = ready_q.pop();
+                if (!pg) break;  // readers all exited unexpectedly
+                launch_slot(free_slot, *pg);
+                continue;
+            }
+
+            // Nothing freed and no slot open: block on slot 0's event
+            // instead of spinning.
+            if (!drained_any && free_slot < 0) {
+                CUDA_CHECK(cudaEventSynchronize(slots[0].done));
+                drain_slot(0);
+            }
         }
 
-        int free_slot = -1;
-        for (int i = 0; i < n_streams; ++i) {
-            if (!slots[i].busy) { free_slot = i; break; }
-        }
-        if (free_slot >= 0 && n_launched < target) {
-            auto pg = ready_q.pop();
-            if (!pg) break;  // readers all exited unexpectedly
-            launch_slot(free_slot, *pg);
-            continue;
+        if (reader_fault.load()) {
+            throw std::runtime_error(
+                "cuHLL union: reader failed: " + reader_error);
         }
 
-        // Nothing freed and no slot open: block on slot 0's event
-        // instead of spinning.
-        if (!drained_any && free_slot < 0) {
-            CUDA_CHECK(cudaEventSynchronize(slots[0].done));
-            drain_slot(0);
-        }
+        // Drain any in-flight kernels before reading the registers.
+        CUDA_CHECK(cudaDeviceSynchronize());
+        union_est = union_sketch.estimate();
+    } catch (...) {
+        teardown();
+        throw;
     }
 
-    ready_q.close();
-    for (auto& t : readers) t.join();
-
-    if (reader_fault.load()) {
-        throw std::runtime_error("cuHLL union: reader failed: " + reader_error);
-    }
-
-    // Drain any in-flight kernels before reading the registers.
-    CUDA_CHECK(cudaDeviceSynchronize());
-    const std::uint64_t union_est = union_sketch.estimate();
-
-    for (int i = 0; i < n_streams; ++i) {
-        auto& sl = slots[i];
-        if (sl.done)   cudaEventDestroy(sl.done);
-        if (sl.stream) cudaStreamDestroy(sl.stream);
-        if (sl.d_in)   cudaFree(sl.d_in);
-        if (sl.h_in)   cudaFreeHost(sl.h_in);
-    }
-
+    teardown();
     return union_est;
 }
 

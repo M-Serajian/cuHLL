@@ -1,6 +1,7 @@
 #include "cuHLL/concurrent.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +19,21 @@ namespace cuhll {
 // -----------------------------------------------------------------------------
 // survey_inputs: stat each input path and compute N / median / max / total.
 // -----------------------------------------------------------------------------
+// Heuristic inflation when reading compressed inputs. Sequence content
+// after decompressing + parsing is roughly the same magnitude as the
+// compressed file size for FASTQ (4 lines/record × ~3× gzip ratio ×
+// ~25% sequence fraction ≈ 1×), but for FASTA.gz it's ~3×. We pick a
+// shared 4× upper bound so the per-stream pinned buffer is big enough
+// for either format without inspecting the file's content.
+constexpr std::size_t kGzipInflationFactor = 4;
+
+static bool path_is_gzip(const std::string& p) {
+    if (p.size() < 3) return false;
+    auto e = p.substr(p.size() - 3);
+    for (auto& c : e) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return e == ".gz";
+}
+
 InputSurvey survey_inputs(const std::vector<std::string>& paths) {
     InputSurvey s;
     s.n = paths.size();
@@ -31,7 +47,8 @@ InputSurvey survey_inputs(const std::vector<std::string>& paths) {
             throw std::runtime_error(std::string("cuHLL survey: cannot stat ")
                                      + p + ": " + std::strerror(errno));
         }
-        const auto sz = static_cast<std::size_t>(st.st_size);
+        std::size_t sz = static_cast<std::size_t>(st.st_size);
+        if (path_is_gzip(p)) sz *= kGzipInflationFactor;
         sizes.push_back(sz);
         s.bytes_total += sz;
         if (sz > s.bytes_max) s.bytes_max = sz;

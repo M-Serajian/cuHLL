@@ -556,6 +556,8 @@ CPMAddPackage(
 )
 
 find_package(CUDAToolkit REQUIRED)
+# zlib for transparent FASTA/FASTQ + .gz reading in src/fasta.cpp.
+find_package(ZLIB REQUIRED)
 
 # -----------------------------------------------------------------------------
 # Milestone (a) probe target
@@ -607,7 +609,7 @@ add_library(cuhll_core STATIC
     src/pipeline_concurrent.cu
 )
 target_include_directories(cuhll_core PUBLIC include)
-target_link_libraries(cuhll_core PUBLIC cuco::cuco CUDA::cudart)
+target_link_libraries(cuhll_core PUBLIC cuco::cuco CUDA::cudart ZLIB::ZLIB)
 set_target_properties(cuhll_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON
@@ -636,6 +638,15 @@ endif()
 # so it cannot collide with a parent project's CTest BUILD_TESTING when cuHLL
 # is consumed as a subdirectory.
 # -----------------------------------------------------------------------------
+# NVTX range markers for Nsight Systems / Nsight Compute. Header-only,
+# part of the CUDA toolkit; the runtime cost is zero unless a profiler
+# is attached. ON by default; -DCUHLL_NVTX=OFF removes the macro
+# expansions entirely (see include/cuHLL/nvtx_util.hpp).
+option(CUHLL_NVTX "Annotate cuHLL with NVTX range markers" ON)
+if(CUHLL_NVTX)
+    add_compile_definitions(CUHLL_NVTX)
+endif()
+
 option(CUHLL_BUILD_TESTS "Build cuHLL test suite (requires GPU to run)" OFF)
 if(CUHLL_BUILD_TESTS)
     enable_testing()

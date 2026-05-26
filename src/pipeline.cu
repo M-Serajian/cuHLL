@@ -3,6 +3,7 @@
 #include "cuHLL/cuda_check.hpp"
 #include "cuHLL/fasta.hpp"
 #include "cuHLL/kmer_kernel.cuh"
+#include "cuHLL/nvtx_util.hpp"
 #include "cuHLL/pipeline.hpp"
 #include "cuHLL/sketch.hpp"
 #include "cuHLL/sketch_internal.cuh"
@@ -26,6 +27,7 @@ void sketch_sequence_single_stream(Sketch& sketch,
                                    const char* seq,
                                    std::size_t len,
                                    int k) {
+    CUHLL_NVTX_RANGE("sketch_sequence_single_stream");
     if (len == 0 || static_cast<std::int64_t>(len) < k) return;
 
     char* d_seq = nullptr;
@@ -158,6 +160,7 @@ void sketch_sequences_streaming(Sketch& sketch,
                                 const std::vector<std::string>& paths,
                                 int k,
                                 std::size_t chunk_mb) {
+    CUHLL_NVTX_RANGE("sketch_sequences_streaming");
     if (paths.empty()) return;
     if (chunk_mb == 0) {
         throw std::invalid_argument("cuHLL: --chunk-mb must be >= 1");
