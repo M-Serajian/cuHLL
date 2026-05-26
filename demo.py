@@ -1,35 +1,35 @@
 """cuHLL end-to-end demo.
 
 Run:
-    python demo.py                # walk through every public function
-    python demo.py --profile      # plus produce an Nsight Systems timeline
+    python demo.py
 
 What this script does:
-  1.  Generates one synthetic "challenging" FASTA in a fresh tempdir.
-      The FASTA mixes:
-        - random ACGT (high-entropy baseline),
-        - exact-repeat motifs (so the true distinct-kmer count is
-          well below the total k-mer positions — checks HLL collapses
-          duplicates correctly),
-        - a palindromic region (self-reverse-complement; tests that
-          canonical k-mers fold fwd/rc into one register update), and
-        - multi-record layout with an intra-record N-break (tests
-          window-break handling).
-  2.  Generates a gzipped FASTQ derived from the same bases (tests
-      cuhll's FASTQ + gzip auto-detection).
-  3.  Runs every public cuhll function on these inputs.
-  4.  With --profile, re-runs the heaviest call under nsys and writes
-      ./profile_out/cuhll_demo.nsys-rep so you can open it in
-      Nsight Systems.
+  1.  Generates a ~200 Mbp synthetic FASTA inside the project's tmp/
+      directory. The FASTA mixes:
+        - random ACGT (high-entropy baseline, ~180 Mbp),
+        - exact-repeat motifs (~20 Mbp total of repeats: tests that
+          HLL collapses duplicate k-mers down to the distinct count),
+        - a palindromic region (~1 Mbp self-reverse-complement: tests
+          that canonical k-mers fold fwd/rc onto one register update),
+          and
+        - a short third record so the inter-record 'N' boundary is
+          exercised.
+  2.  Generates a gzipped FASTQ derived from the same bases — exercises
+      cuhll's FASTQ + gzip auto-detection.
+  3.  Runs every public cuhll function on these inputs so all of the
+      pipeline paths (single-FASTA fast path, concurrent per-genome,
+      concurrent shared-sketch union, .hll I/O) hit the kernel.
+  4.  Re-runs the heaviest call under Nsight Systems and saves the
+      timeline to <project>/tmp/profile_out/cuhll_demo.nsys-rep.
 
-Nothing is left behind from the demo's tempdir. With --profile, the
-.nsys-rep is moved to ./profile_out/ so it survives.
+All intermediate files (the synthetic FASTA, FASTQ.gz, per-genome .hll
+sketches) are created under <project>/tmp/cuhll_demo_*/ and deleted at
+exit. The NSYS timeline survives — it's how you can open the run
+afterward in `nsys-ui` or run `nsys stats` on it.
 """
 from __future__ import annotations
 
-import argparse
 import gzip
-import random
 import shutil
 import subprocess
 import sys
@@ -37,101 +37,135 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+
 import cuhll
 
 
 # --- knobs ------------------------------------------------------------
-K = 31
-BACKGROUND_BP = 2_000_000      # random ACGT baseline length
-REPEAT_MOTIF_LEN = 100         # exact-repeat motif length
-REPEAT_COUNT = 500             # how many times each motif repeats
-PALINDROME_BP = 50_000         # palindromic block size
-N_REPEAT_MOTIFS = 5            # how many distinct repeated motifs to sprinkle
-SEED = 42
+# Sizes chosen so the whole synthetic genome lands at ~200 Mbp — large
+# enough that the GPU pipeline runs in steady state (auto-tune picks
+# real stream counts, kernel SM occupancy is meaningful, H2D/kernel
+# overlap is visible) rather than a few microseconds of one-shot work.
+# That makes the NSYS timeline informative.
+K                  = 31
+BACKGROUND_BP      = 180_000_000   # random ACGT background (~180 Mbp)
+REPEAT_MOTIF_LEN   = 200           # length of each exact-repeat motif
+REPEAT_COUNT       = 5_000         # how many times each motif repeats
+N_REPEAT_MOTIFS    = 20            # number of distinct motifs (→ 20 Mbp repeats)
+PALINDROME_BP      = 1_000_000     # palindromic block (~1 Mbp)
+TAIL_RECORD_BP     = 200_000       # final short record (intra-record N-break test)
+SEED               = 42
 
 
-def revcomp(s: str) -> str:
-    comp = {"A": "T", "C": "G", "G": "C", "T": "A", "N": "N"}
-    return "".join(comp[b] for b in reversed(s))
+def _rand_bases_bytes(n: int, rng: np.random.Generator) -> bytes:
+    """Vectorized random ACGT generation. ~100× faster than
+    random.choices('ACGT', k=n) for the 200 Mbp scale this demo runs at.
+    """
+    idx = rng.integers(0, 4, size=n, dtype=np.uint8)
+    table = np.array([ord('A'), ord('C'), ord('G'), ord('T')], dtype=np.uint8)
+    return table[idx].tobytes()
 
 
-def make_challenging_fasta(out_path: Path) -> None:
-    """Write a 3-record FASTA tailored to stress cuhll.
+def _revcomp_bytes(b: bytes) -> bytes:
+    table = bytes.maketrans(b"ACGTN", b"TGCAN")
+    return b.translate(table)[::-1]
 
-    Record 1: random ACGT plus N_REPEAT_MOTIFS distinct motifs each
-              repeated REPEAT_COUNT times. The repeats let us verify
-              that HLL collapses duplicate k-mers down to a distinct
-              count.
+
+def make_challenging_fasta(out_path: Path) -> int:
+    """Write a 3-record ~200 Mbp FASTA tailored to stress cuhll.
+
+    Record 1: random ACGT background + N_REPEAT_MOTIFS distinct motifs,
+              each repeated REPEAT_COUNT times. The repeats verify that
+              HLL collapses duplicates down to a distinct count.
     Record 2: a palindromic block (sequence ++ its reverse complement).
               Every k-mer inside the palindrome has its reverse
-              complement also present. With canonical=True both fold
+              complement present, so canonical=True must fold fwd+rc
               onto the same register update.
-    Record 3: a short random fragment, exercising the boundary 'N' that
+    Record 3: short random fragment that exercises the boundary 'N'
               cuhll injects between FASTA records.
+
+    Returns the total base count written.
     """
-    rng = random.Random(SEED)
-    bases = "ACGT"
+    rng = np.random.default_rng(SEED)
 
-    def rand(n: int) -> str:
-        return "".join(rng.choices(bases, k=n))
+    bg = _rand_bases_bytes(BACKGROUND_BP, rng)
+    motifs = [_rand_bases_bytes(REPEAT_MOTIF_LEN, rng) for _ in range(N_REPEAT_MOTIFS)]
+    rec1 = bg + b"".join(m * REPEAT_COUNT for m in motifs)
 
-    motifs = [rand(REPEAT_MOTIF_LEN) for _ in range(N_REPEAT_MOTIFS)]
-    rec1_chunks = [rand(BACKGROUND_BP)]
-    for m in motifs:
-        rec1_chunks.append(m * REPEAT_COUNT)
-    rec1 = "".join(rec1_chunks)
+    half = _rand_bases_bytes(PALINDROME_BP // 2, rng)
+    rec2 = half + _revcomp_bytes(half)
 
-    half = rand(PALINDROME_BP // 2)
-    rec2 = half + revcomp(half)
+    rec3 = _rand_bases_bytes(TAIL_RECORD_BP, rng)
 
-    rec3 = rand(50_000)
-
-    with out_path.open("w") as f:
+    total_bp = 0
+    LINE = 80
+    with out_path.open("wb") as f:
         for i, body in enumerate((rec1, rec2, rec3), start=1):
-            f.write(f">record_{i}_len{len(body)}\n")
-            for j in range(0, len(body), 80):
-                f.write(body[j : j + 80] + "\n")
+            f.write(f">record_{i}_len{len(body)}\n".encode())
+            for j in range(0, len(body), LINE):
+                f.write(body[j : j + LINE])
+                f.write(b"\n")
+            total_bp += len(body)
+    return total_bp
 
 
 def make_fastq_gz_from_fasta(fa_path: Path, fq_gz_path: Path,
                              read_len: int = 150) -> None:
-    """Chop the FASTA bases into read_len-bp reads and emit gzipped FASTQ.
+    """Chop the FASTA bases into read_len-bp reads, emit gzipped FASTQ.
 
-    Quality is a constant Phred-40 string. Reads that would span the
-    record-boundary 'N' are skipped, so the FASTQ k-mer set is *almost*
-    identical to the FASTA's — close enough that the two cardinalities
-    should agree within HLL noise.
+    Quality is a constant Phred-40 string. Reads spanning the
+    record-boundary 'N' (cuhll injects one between records) are skipped,
+    so the FASTQ k-mer set is *almost* identical to the FASTA's — close
+    enough that the two cardinalities should agree within HLL noise.
+
+    Read the FASTA in chunks so we don't pull a 200 MB string into RAM.
     """
-    bases = []
-    with fa_path.open() as fa:
-        for line in fa:
-            if line.startswith(">"):
-                continue
-            bases.append(line.strip())
-    seq = "".join(bases)
+    qual_bytes = (b"I" * read_len) + b"\n"
+    plus_bytes = b"+\n"
+    nl = b"\n"
 
-    qual = "I" * read_len
-    with gzip.open(fq_gz_path, "wt", compresslevel=4) as fq:
-        for i, start in enumerate(range(0, len(seq) - read_len + 1, read_len)):
-            read = seq[start : start + read_len]
-            if "N" in read:
+    # Accumulate sequence bytes only (skip headers) into one bytearray.
+    seq = bytearray()
+    with fa_path.open("rb") as fa:
+        for line in fa:
+            if line.startswith(b">"):
                 continue
-            fq.write(f"@read{i}\n{read}\n+\n{qual}\n")
+            seq.extend(line.rstrip(b"\n"))
+
+    n_reads = 0
+    with gzip.open(fq_gz_path, "wb", compresslevel=4) as fq:
+        for start in range(0, len(seq) - read_len + 1, read_len):
+            read = bytes(seq[start : start + read_len])
+            if b"N" in read:
+                continue
+            fq.write(b"@read%d\n" % n_reads)
+            fq.write(read)
+            fq.write(nl)
+            fq.write(plus_bytes)
+            fq.write(qual_bytes)
+            n_reads += 1
 
 
 def run_demo(tmp: Path) -> None:
     print(f"cuhll version: {cuhll.__version__}")
-    print(f"tempdir:       {tmp}")
+    print(f"workdir (auto-cleaned): {tmp}")
 
     fa = tmp / "challenge.fasta"
-    print(f"\n[gen] writing challenge FASTA → {fa.name}")
-    make_challenging_fasta(fa)
-    print(f"      size: {fa.stat().st_size / 1024:.1f} KiB")
+    print(f"\n[gen] writing ~200 Mbp challenge FASTA → {fa.name}")
+    t0 = time.perf_counter()
+    total_bp = make_challenging_fasta(fa)
+    sz_mb = fa.stat().st_size / (1024 ** 2)
+    print(f"      {total_bp:,} bp, {sz_mb:.1f} MiB on disk, "
+          f"generated in {time.perf_counter() - t0:.1f}s")
 
     fq_gz = tmp / "challenge.fastq.gz"
     print(f"\n[gen] writing FASTQ.gz of the same sequence → {fq_gz.name}")
+    t0 = time.perf_counter()
     make_fastq_gz_from_fasta(fa, fq_gz)
-    print(f"      size: {fq_gz.stat().st_size / 1024:.1f} KiB")
+    sz_mb = fq_gz.stat().st_size / (1024 ** 2)
+    print(f"      {sz_mb:.1f} MiB on disk, "
+          f"generated in {time.perf_counter() - t0:.1f}s")
 
     # 1. One FASTA → cardinality
     print("\n[1] cuhll.estimate(fa, k=31)")
@@ -238,18 +272,28 @@ def run_nsys_profile(tmp: Path, profile_out: Path) -> int:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--profile", action="store_true",
-                    help="also produce an nsys timeline of the heaviest call")
-    args = ap.parse_args()
+    project_root = Path(__file__).resolve().parent
+    project_tmp  = project_root / "tmp"
+    project_tmp.mkdir(exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="cuhll_demo_") as tmp_s:
+    # Project tmp/ hosts both the auto-cleaned demo workdir and the
+    # persistent profile timeline. Keeps everything under one directory
+    # instead of spraying /tmp on the compute node (which is often small).
+    with tempfile.TemporaryDirectory(prefix="cuhll_demo_",
+                                     dir=str(project_tmp)) as tmp_s:
         tmp = Path(tmp_s)
         run_demo(tmp)
+        run_nsys_profile(tmp, project_tmp / "profile_out")
 
-        if args.profile:
-            here = Path(__file__).resolve().parent
-            run_nsys_profile(tmp, here / "profile_out")
+    print()
+    print(f"demo intermediates were under {project_tmp}/cuhll_demo_* "
+          f"(cleaned at exit).")
+    rep_path = project_tmp / "profile_out" / "cuhll_demo.nsys-rep"
+    print(f"profile timeline saved to {rep_path}")
+    print("open it with:")
+    print(f"    nsys-ui {rep_path}")
+    print("or print a text summary with:")
+    print(f"    nsys stats {rep_path}")
 
 
 if __name__ == "__main__":

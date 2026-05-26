@@ -97,17 +97,21 @@ the same thing).
 | `intersect_estimate_many(sketches)` | n-way intersection (n ≤ 4 reliable) |
 | `read(path)` | load a saved sketch |
 
-A runnable demo lives at [`demo.py`](demo.py). It generates a small
-"challenging" FASTA (random ACGT plus exact-repeat motifs, a
-palindromic region, and an inter-record N-break) into a fresh tempdir,
-then feeds it through every public cuhll function — no external data
-needed. Just:
+A runnable demo lives at [`demo.py`](demo.py). It generates a ~200 Mbp
+synthetic FASTA (random ACGT plus exact-repeat motifs, a palindromic
+block, and a multi-record N-break) plus a gzipped FASTQ derived from
+the same bases, then feeds them through every public cuhll function —
+no external data needed:
 
 ```bash
 python demo.py
-python demo.py --profile     # also writes an Nsight Systems timeline
-                             # to ./profile_out/cuhll_demo.nsys-rep
 ```
+
+The demo also runs the heaviest call under Nsight Systems and saves
+the timeline. All demo intermediates (FASTA, FASTQ.gz, per-genome
+`.hll`) live under `tmp/cuhll_demo_*/` and are cleaned on exit;
+the NSYS timeline is saved to `tmp/profile_out/cuhll_demo.nsys-rep`
+(open it with `nsys-ui` or `nsys stats`).
 
 ## Tests
 
@@ -128,6 +132,7 @@ To check cuHLL estimates against an exact ground truth, install KMC3
 | `cuHLL: GCC X.Y is too old` | `module load gcc/12.2.0` (or newer) |
 | `CMake X.Y or higher is required` | `module unload cmake` — let pip fetch one |
 | `Can't connect to HTTPS URL (SSL)` | HPC `python/X` module has no SSL — use system `python3` or a venv |
+| `libcudart.so.12: cannot open shared object file` | the CUDA Toolkit isn't on `LD_LIBRARY_PATH` at runtime; reload it (`module load cuda/12.8.1`). Once the PyPI wheel ships, this goes away — `libcudart` will be bundled. |
 | `libstdc++.so.6: GLIBCXX_*` not found | rebuild with `-DCUHLL_STATIC_LIBSTDCXX=ON` (default on auto-discovered gcc) |
 
 If you're filing a bug, please include the output of
