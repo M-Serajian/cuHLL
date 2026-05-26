@@ -34,6 +34,16 @@ This builds the C++/CUDA library, the Python bindings, and the `cuhll`
 CLI binary all at once. After it finishes, `import cuhll` works and
 the CLI is at `build/<wheel-tag>/bin/cuhll`.
 
+To confirm everything is wired up, run the demo:
+
+```bash
+python demo.py
+```
+
+It generates a synthetic ~200 Mbp FASTA in `tmp/`, walks every public
+function, and prints an `nsys-ui …` command at the end pointing to the
+profile timeline.
+
 ### 2. CMake-only (C++/CLI without Python)
 
 If you only want the C++ library and the CLI:
@@ -53,6 +63,13 @@ Common flags:
 cmake .. -DCMAKE_CUDA_ARCHITECTURES=89    # one GPU arch (smaller, faster compile)
 cmake .. -DCMAKE_CUDA_ARCHITECTURES=NATIVE # detect from the GPU on the build host
 cmake .. -DCUHLL_BUILD_TESTS=ON            # also build the C++ test suite
+```
+
+A quick smoke test of the binary:
+
+```bash
+./bin/cuco_probe                                       # GPU + cuco wiring check
+./bin/cuhll --k 31 /path/to/genome.fasta               # one-file cardinality
 ```
 
 To link cuhll from another CMake project:
