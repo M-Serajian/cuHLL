@@ -43,37 +43,61 @@ import cuhll
 
 
 # --- knobs ------------------------------------------------------------
-# Sizes chosen so the whole synthetic genome lands at ~200 Mbp — large
-# enough that the GPU pipeline runs in steady state (auto-tune picks
-# real stream counts, kernel SM occupancy is meaningful, H2D/kernel
-# overlap is visible) rather than a few microseconds of one-shot work.
-# That makes the NSYS timeline informative.
+# Sizes chosen so the whole synthetic genome lands at 5.131 Gbp —
+# human-haploid-scale. The pipeline runs in true steady state: the
+# auto-tune picks full stream counts, kernels run for seconds (not
+# microseconds), and the NSYS timeline shows real H2D/kernel overlap.
+#
+# Memory note: the C++ reader slurps the whole FASTA into one
+# std::string (~5 GB) and per-stream pinned buffers scale with input
+# size, so the steps that pass `[fa, fa, fa]` to the concurrent
+# pipeline can peak around 30 GB host RAM. Recommend `--mem=64G`
+# (or larger) when running under srun.
 K                  = 31
-BACKGROUND_BP      = 180_000_000   # random ACGT background (~180 Mbp)
-REPEAT_MOTIF_LEN   = 200           # length of each exact-repeat motif
-REPEAT_COUNT       = 5_000         # how many times each motif repeats
-N_REPEAT_MOTIFS    = 20            # number of distinct motifs (→ 20 Mbp repeats)
-PALINDROME_BP      = 1_000_000     # palindromic block (~1 Mbp)
-TAIL_RECORD_BP     = 200_000       # final short record (intra-record N-break test)
+BACKGROUND_BP      = 4_500_000_000   # random ACGT background
+REPEAT_MOTIF_LEN   = 200             # length of each exact-repeat motif
+REPEAT_COUNT       = 5_000           # each motif repeats this many times (→ 1 Mbp/motif)
+N_REPEAT_MOTIFS    = 600             # → 600 Mbp of repeats total
+PALINDROME_BP      = 30_000_000      # palindromic block (~30 Mbp)
+TAIL_RECORD_BP     = 1_000_000       # final short record (intra-record N-break test)
+# Total bp = BACKGROUND_BP + N_REPEAT_MOTIFS * REPEAT_MOTIF_LEN * REPEAT_COUNT
+#         + PALINDROME_BP + TAIL_RECORD_BP
+#         = 4,500,000,000 + 600,000,000 + 30,000,000 + 1,000,000 = 5,131,000,000
+
+# FASTQ.gz is generated separately at a smaller, fixed size so that
+# (a) we don't spend minutes gzipping 5 Gbp, and (b) the FASTQ path is
+# still exercised end-to-end. The two cardinalities therefore aren't
+# expected to match — this is documented in the demo output.
+FASTQ_SAMPLE_BP    = 200_000_000     # 200 Mbp of FASTQ.gz reads
+FASTQ_READ_LEN     = 150
 SEED               = 42
 
 
+_BASE_TABLE = np.array([ord('A'), ord('C'), ord('G'), ord('T')], dtype=np.uint8)
+_RC_TABLE = bytes.maketrans(b"ACGTN", b"TGCAN")
+_GEN_CHUNK_BP = 100_000_000          # 100 Mbp per generation chunk — caps RAM
+
+
 def _rand_bases_bytes(n: int, rng: np.random.Generator) -> bytes:
-    """Vectorized random ACGT generation. ~100× faster than
-    random.choices('ACGT', k=n) for the 200 Mbp scale this demo runs at.
-    """
+    """Vectorized random ACGT generation."""
     idx = rng.integers(0, 4, size=n, dtype=np.uint8)
-    table = np.array([ord('A'), ord('C'), ord('G'), ord('T')], dtype=np.uint8)
-    return table[idx].tobytes()
+    return _BASE_TABLE[idx].tobytes()
 
 
-def _revcomp_bytes(b: bytes) -> bytes:
-    table = bytes.maketrans(b"ACGTN", b"TGCAN")
-    return b.translate(table)[::-1]
+def _stream_random_bases(f, n: int, rng: np.random.Generator) -> None:
+    """Write n random ACGT bases to file in fixed-size chunks. Peak
+    memory is one chunk (~100 MB), regardless of n. Needed because the
+    FASTA's background block is 4.5 Gbp — generating it as one numpy
+    array would peak well above 4 GB of RAM."""
+    remaining = n
+    while remaining > 0:
+        sz = min(_GEN_CHUNK_BP, remaining)
+        f.write(_rand_bases_bytes(sz, rng))
+        remaining -= sz
 
 
 def make_challenging_fasta(out_path: Path) -> int:
-    """Write a 3-record ~200 Mbp FASTA tailored to stress cuhll.
+    """Write a 3-record ~5.131 Gbp FASTA tailored to stress cuhll.
 
     Record 1: random ACGT background + N_REPEAT_MOTIFS distinct motifs,
               each repeated REPEAT_COUNT times. The repeats verify that
@@ -85,66 +109,79 @@ def make_challenging_fasta(out_path: Path) -> int:
     Record 3: short random fragment that exercises the boundary 'N'
               cuhll injects between FASTA records.
 
+    Bases are written as one long line per record (no 80-char wrap).
+    cuhll's reader strips any newline anyway; emitting one big write
+    per record is dramatically faster than looping over millions of
+    80-char slices in Python.
+
     Returns the total base count written.
     """
     rng = np.random.default_rng(SEED)
-
-    bg = _rand_bases_bytes(BACKGROUND_BP, rng)
-    motifs = [_rand_bases_bytes(REPEAT_MOTIF_LEN, rng) for _ in range(N_REPEAT_MOTIFS)]
-    rec1 = bg + b"".join(m * REPEAT_COUNT for m in motifs)
-
-    half = _rand_bases_bytes(PALINDROME_BP // 2, rng)
-    rec2 = half + _revcomp_bytes(half)
-
-    rec3 = _rand_bases_bytes(TAIL_RECORD_BP, rng)
-
     total_bp = 0
-    LINE = 80
+
     with out_path.open("wb") as f:
-        for i, body in enumerate((rec1, rec2, rec3), start=1):
-            f.write(f">record_{i}_len{len(body)}\n".encode())
-            for j in range(0, len(body), LINE):
-                f.write(body[j : j + LINE])
-                f.write(b"\n")
-            total_bp += len(body)
+        # ---- record 1: random background + exact-repeat motifs ----
+        f.write(b">record_1_random_plus_repeats\n")
+        _stream_random_bases(f, BACKGROUND_BP, rng)
+        total_bp += BACKGROUND_BP
+        for _ in range(N_REPEAT_MOTIFS):
+            motif = _rand_bases_bytes(REPEAT_MOTIF_LEN, rng)
+            f.write(motif * REPEAT_COUNT)
+            total_bp += REPEAT_MOTIF_LEN * REPEAT_COUNT
+        f.write(b"\n")
+
+        # ---- record 2: palindromic block ----
+        f.write(b">record_2_palindrome\n")
+        half = _rand_bases_bytes(PALINDROME_BP // 2, rng)
+        f.write(half)
+        f.write(half.translate(_RC_TABLE)[::-1])
+        total_bp += PALINDROME_BP
+        f.write(b"\n")
+
+        # ---- record 3: tail random fragment ----
+        f.write(b">record_3_tail\n")
+        f.write(_rand_bases_bytes(TAIL_RECORD_BP, rng))
+        total_bp += TAIL_RECORD_BP
+        f.write(b"\n")
+
     return total_bp
 
 
-def make_fastq_gz_from_fasta(fa_path: Path, fq_gz_path: Path,
-                             read_len: int = 150) -> None:
-    """Chop the FASTA bases into read_len-bp reads, emit gzipped FASTQ.
+def make_sample_fastq_gz(fq_gz_path: Path) -> int:
+    """Generate a small standalone gzipped FASTQ — its purpose is to
+    exercise cuhll's FASTQ + gzip auto-detection, not to match the 5 Gbp
+    FASTA's cardinality. We emit FASTQ_SAMPLE_BP bases worth of
+    independently-random reads (constant Phred-40 quality, fixed read
+    length, no headers shared with the FASTA).
 
-    Quality is a constant Phred-40 string. Reads spanning the
-    record-boundary 'N' (cuhll injects one between records) are skipped,
-    so the FASTQ k-mer set is *almost* identical to the FASTA's — close
-    enough that the two cardinalities should agree within HLL noise.
-
-    Read the FASTA in chunks so we don't pull a 200 MB string into RAM.
+    Returns the total sequenced base count.
     """
-    qual_bytes = (b"I" * read_len) + b"\n"
+    rng = np.random.default_rng(SEED + 1)
+    qual_bytes = (b"I" * FASTQ_READ_LEN) + b"\n"
     plus_bytes = b"+\n"
-    nl = b"\n"
+    n_reads = FASTQ_SAMPLE_BP // FASTQ_READ_LEN
+    total_bp = 0
 
-    # Accumulate sequence bytes only (skip headers) into one bytearray.
-    seq = bytearray()
-    with fa_path.open("rb") as fa:
-        for line in fa:
-            if line.startswith(b">"):
-                continue
-            seq.extend(line.rstrip(b"\n"))
-
-    n_reads = 0
+    # Batch reads so we make ~one gzip write per 1000 reads instead of
+    # per read. ~10× faster than the read-by-read version, important at
+    # 200 Mbp scale where there are 1.3M reads.
+    BATCH = 1000
+    out_buf = bytearray()
     with gzip.open(fq_gz_path, "wb", compresslevel=4) as fq:
-        for start in range(0, len(seq) - read_len + 1, read_len):
-            read = bytes(seq[start : start + read_len])
-            if b"N" in read:
-                continue
-            fq.write(b"@read%d\n" % n_reads)
-            fq.write(read)
-            fq.write(nl)
-            fq.write(plus_bytes)
-            fq.write(qual_bytes)
-            n_reads += 1
+        for batch_start in range(0, n_reads, BATCH):
+            batch_n = min(BATCH, n_reads - batch_start)
+            block = _rand_bases_bytes(batch_n * FASTQ_READ_LEN, rng)
+            out_buf.clear()
+            for i in range(batch_n):
+                read = block[i * FASTQ_READ_LEN : (i + 1) * FASTQ_READ_LEN]
+                out_buf += b"@read%d\n" % (batch_start + i)
+                out_buf += read
+                out_buf += b"\n"
+                out_buf += plus_bytes
+                out_buf += qual_bytes
+                total_bp += FASTQ_READ_LEN
+            fq.write(out_buf)
+    return total_bp
 
 
 def run_demo(tmp: Path) -> None:
@@ -152,7 +189,7 @@ def run_demo(tmp: Path) -> None:
     print(f"workdir (auto-cleaned): {tmp}")
 
     fa = tmp / "challenge.fasta"
-    print(f"\n[gen] writing ~200 Mbp challenge FASTA → {fa.name}")
+    print(f"\n[gen] writing ~5.131 Gbp challenge FASTA → {fa.name}")
     t0 = time.perf_counter()
     total_bp = make_challenging_fasta(fa)
     sz_mb = fa.stat().st_size / (1024 ** 2)
@@ -160,11 +197,15 @@ def run_demo(tmp: Path) -> None:
           f"generated in {time.perf_counter() - t0:.1f}s")
 
     fq_gz = tmp / "challenge.fastq.gz"
-    print(f"\n[gen] writing FASTQ.gz of the same sequence → {fq_gz.name}")
+    print(f"\n[gen] writing standalone {FASTQ_SAMPLE_BP // 1_000_000} Mbp "
+          f"FASTQ.gz sample → {fq_gz.name}")
+    print("      (independent of the FASTA — exists to exercise the "
+          "FASTQ + gzip path,")
+    print("       not to numerically match the 5 Gbp FASTA's cardinality)")
     t0 = time.perf_counter()
-    make_fastq_gz_from_fasta(fa, fq_gz)
+    fq_bp = make_sample_fastq_gz(fq_gz)
     sz_mb = fq_gz.stat().st_size / (1024 ** 2)
-    print(f"      {sz_mb:.1f} MiB on disk, "
+    print(f"      {fq_bp:,} bp, {sz_mb:.1f} MiB on disk, "
           f"generated in {time.perf_counter() - t0:.1f}s")
 
     # 1. One FASTA → cardinality
@@ -172,12 +213,10 @@ def run_demo(tmp: Path) -> None:
     n = cuhll.estimate(fa, k=K)
     print(f"    {n:,} distinct canonical {K}-mers")
 
-    # 2. Same content as FASTQ.gz (auto-detected by cuhll)
-    print("\n[2] cuhll.estimate(fastq.gz, k=31)")
+    # 2. Independent FASTQ.gz sample (auto-detected by cuhll)
+    print("\n[2] cuhll.estimate(fastq.gz, k=31)  — small standalone sample")
     n_fq = cuhll.estimate(fq_gz, k=K)
-    diff_pct = (n_fq - n) / n * 100
-    print(f"    {n_fq:,}    (vs FASTA: {diff_pct:+.3f}%; FASTQ skips "
-          f"reads spanning the N-break, so a small diff is expected)")
+    print(f"    {n_fq:,} distinct canonical {K}-mers in the {fq_bp:,} bp sample")
 
     # 3. Sketch object
     print("\n[3] cuhll.sketch(fa, k=31) → Sketch")
@@ -231,7 +270,9 @@ def run_demo(tmp: Path) -> None:
 
 
 def run_nsys_profile(tmp: Path, profile_out: Path) -> int:
-    """Run the heaviest cuhll call under nsys and save the timeline.
+    """Profile the heaviest cuhll call under nsys, save the .nsys-rep,
+    and print a text summary so the user gets useful output without
+    needing the GUI (nsys-ui rarely works on HPC login nodes).
 
     Looks for nsys on PATH, then under /apps/compilers/cuda/13.2.1/bin/
     (HiPerGator default), then gives up.
@@ -264,11 +305,28 @@ def run_nsys_profile(tmp: Path, profile_out: Path) -> int:
     ]
     print(f"\n[profile] running nsys → {rep}.nsys-rep", file=sys.stderr)
     r = subprocess.run(cmd)
-    if r.returncode == 0:
-        print(f"[profile] saved   : {rep}.nsys-rep", file=sys.stderr)
-        print(f"[profile] view GUI: nsys-ui {rep}.nsys-rep", file=sys.stderr)
-        print(f"[profile] view CLI: nsys stats {rep}.nsys-rep", file=sys.stderr)
-    return r.returncode
+    if r.returncode != 0:
+        print(f"[profile] nsys profile failed (rc={r.returncode})",
+              file=sys.stderr)
+        return r.returncode
+
+    # Print a text summary right here — nsys-ui usually can't run on
+    # cluster login nodes (no OpenGL / Qt platform plugin), so the text
+    # tables from `nsys stats` are the most reliable way to actually read
+    # the profile in place.
+    rep_file = f"{rep}.nsys-rep"
+    print(f"\n[profile] saved: {rep_file}", file=sys.stderr)
+    print("[profile] text summary (top CUDA API calls + kernels + memcpys):",
+          file=sys.stderr)
+    stats_cmd = [
+        nsys, "stats",
+        "--force-overwrite", "true",
+        "--force-export=true",   # nuke any stale .sqlite from a prior run
+        "--report", "cuda_api_sum,cuda_gpu_kern_sum,cuda_gpu_mem_size_sum",
+        rep_file,
+    ]
+    subprocess.run(stats_cmd)
+    return 0
 
 
 def main() -> None:
@@ -290,10 +348,17 @@ def main() -> None:
           f"(cleaned at exit).")
     rep_path = project_tmp / "profile_out" / "cuhll_demo.nsys-rep"
     print(f"profile timeline saved to {rep_path}")
-    print("open it with:")
+    print()
+    print("re-print the text summary any time with:")
+    print(f"    nsys stats --force-export=true {rep_path}")
+    print("(the --force-export=true is needed when re-running over a stale")
+    print(" .sqlite cache nsys leaves next to the .nsys-rep)")
+    print()
+    print("for the GUI timeline, copy the .nsys-rep to a workstation with")
+    print("Nsight Systems installed and open it there:")
     print(f"    nsys-ui {rep_path}")
-    print("or print a text summary with:")
-    print(f"    nsys stats {rep_path}")
+    print("(nsys-ui needs OpenGL + Qt6 + a real X server, so it usually")
+    print(" can't run on HPC login nodes directly.)")
 
 
 if __name__ == "__main__":

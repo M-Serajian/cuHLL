@@ -22,37 +22,44 @@
 #include "cuHLL/common.hpp"
 #include "cuHLL/concurrent.hpp"
 #include "cuHLL/hll_file.hpp"
+#include "cuHLL/fasta.hpp"
 #include "cuHLL/pipeline.hpp"
 #include "cuHLL/sketch.hpp"
 
 namespace py = pybind11;
 
 // One-shot helper used by the Pythonic `cuhll.sketch(path, k=...)` entry
-// point. Always routes through the streaming pipeline so behaviour matches
-// the cuhll CLI's default path for arbitrary FASTA sizes.
+// point. Uses the I2 fast path: read_fasta_concat handles FASTA, FASTQ,
+// and gzip transparently, and sketch_sequence_single_stream submits the
+// whole sequence in one kernel launch. `chunk_mb` is kept for API
+// compatibility but unused here (chunking only matters on the streaming
+// pipeline, which is for very large single files).
 static cuhll::Sketch sketch_one_fasta(const std::string& path,
                                       int k,
                                       int precision,
                                       bool canonical,
-                                      std::size_t chunk_mb) {
+                                      std::size_t /*chunk_mb*/) {
     cuhll::Sketch s(precision, canonical);
-    cuhll::sketch_sequences_streaming(s, {path}, k, chunk_mb);
+    std::string seq = cuhll::read_fasta_concat(path);
+    cuhll::sketch_sequence_single_stream(s, seq.data(), seq.size(), k);
     return s;
 }
 
-// Sketch many FASTAs into a single Sketch (their union). Mirrors the
-// CLI's default mode (`cuhll a.fa b.fa c.fa` with no --output-dir or
-// --per-genome). One streaming pass through the pipeline accumulates
-// k-mers from every input into the same registers, so it is faster
-// than per-genome sketching followed by merge.
+// Sketch many FASTAs into a single Sketch (their union). One streaming
+// pass through the pipeline accumulates k-mers from every input into the
+// same registers, so it is faster than per-genome sketching followed by
+// merge. Uses read_fasta_concat per file so FASTQ + gzip are handled.
 static cuhll::Sketch sketch_union_fastas(
         const std::vector<std::string>& paths,
         int k,
         int precision,
         bool canonical,
-        std::size_t chunk_mb) {
+        std::size_t /*chunk_mb*/) {
     cuhll::Sketch s(precision, canonical);
-    cuhll::sketch_sequences_streaming(s, paths, k, chunk_mb);
+    for (const auto& p : paths) {
+        std::string seq = cuhll::read_fasta_concat(p);
+        cuhll::sketch_sequence_single_stream(s, seq.data(), seq.size(), k);
+    }
     return s;
 }
 
