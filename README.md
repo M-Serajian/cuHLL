@@ -97,8 +97,17 @@ the same thing).
 | `intersect_estimate_many(sketches)` | n-way intersection (n ≤ 4 reliable) |
 | `read(path)` | load a saved sketch |
 
-[`demo.py`](demo.py) walks through every public function on a few
-synthetic FASTAs it generates in a tempdir.
+A runnable demo lives at [`demo.py`](demo.py). It generates a small
+"challenging" FASTA (random ACGT plus exact-repeat motifs, a
+palindromic region, and an inter-record N-break) into a fresh tempdir,
+then feeds it through every public cuhll function — no external data
+needed. Just:
+
+```bash
+python demo.py
+python demo.py --profile     # also writes an Nsight Systems timeline
+                             # to ./profile_out/cuhll_demo.nsys-rep
+```
 
 ## Tests
 
