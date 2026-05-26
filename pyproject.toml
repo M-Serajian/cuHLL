@@ -78,7 +78,14 @@ Issues        = "https://github.com/M-Serajian/cuHLL/issues"
 # Reuse the project's existing CMakeLists.txt verbatim; we only flip on the
 # Python-bindings option so the pybind11 module gets built alongside the
 # native targets.
-cmake.version    = ">=3.30"
+# cuco's transitive rapids-cmake dependency requires CMake >= 4.0. Setting
+# the floor here means scikit-build-core will auto-fetch a recent CMake
+# wheel into the isolated build env whenever the user's system cmake is
+# below this floor (or absent). Users on offline HPC clusters that can't
+# reach PyPI mid-build can override via:
+#     pip install . --config-settings=cmake.version=">=3.30"
+# in which case they're responsible for supplying a cmake >= 4.0 on PATH.
+cmake.version    = ">=4.0"
 cmake.args       = ["-DCUHLL_BUILD_PYTHON=ON"]
 # CUHLL_BUILD_TESTS intentionally not pinned here — its CMake-side
 # default is OFF, so a plain `pip install .` skips the C++ tests.

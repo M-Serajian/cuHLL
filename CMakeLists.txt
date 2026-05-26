@@ -143,6 +143,232 @@ message(STATUS
 unset(_cuhll_arch_source)
 
 # -----------------------------------------------------------------------------
+# Toolchain auto-discovery (runs BEFORE project()).
+#
+# If the user has Python but the PATH gcc / nvcc is missing or below our
+# floor, scan canonical install locations (/apps/compilers/, /opt/, etc)
+# for a usable one and point CMake at it. With modules already loaded
+# this is a no-op. We never try to fetch GCC or CUDA — too large,
+# driver/glibc-coupled.
+#
+# Disable with -DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF.
+# -----------------------------------------------------------------------------
+option(CUHLL_AUTODISCOVER_TOOLCHAIN
+    "Scan common install paths for newer gcc/CUDA when PATH versions are inadequate" ON)
+
+set(CUHLL_GCC_FLOOR_PREPROJECT  11)
+set(CUHLL_CUDA_FLOOR_PREPROJECT 12.0)
+
+# --- GCC discovery -----------------------------------------------------------
+# Probe whichever compiler CMake would otherwise pick (CMAKE_CXX_COMPILER,
+# then $CXX, then PATH g++) and version-check it. Override only if it's
+# below the floor — an explicit -DCMAKE_CXX_COMPILER=... wins and we let
+# the post-project floor check complain if that user choice is too old.
+if(CUHLL_AUTODISCOVER_TOOLCHAIN AND NOT DEFINED CMAKE_CXX_COMPILER)
+    set(_cuhll_path_gxx "")
+    if(NOT "$ENV{CXX}" STREQUAL "")
+        # CXX may be "g++" or "g++ -pthread -B /foo" — take first token.
+        string(REGEX MATCH "^[^ \t]+" _cuhll_cxx_first "$ENV{CXX}")
+        # If it's an absolute path, use it directly; otherwise resolve via PATH.
+        if(IS_ABSOLUTE "${_cuhll_cxx_first}")
+            set(_cuhll_path_gxx "${_cuhll_cxx_first}")
+        else()
+            find_program(_cuhll_path_gxx NAMES "${_cuhll_cxx_first}" NO_CACHE)
+        endif()
+        unset(_cuhll_cxx_first)
+    else()
+        find_program(_cuhll_path_gxx g++ NO_CACHE)
+    endif()
+
+    set(_cuhll_path_gxx_ver "0")
+    if(_cuhll_path_gxx AND EXISTS "${_cuhll_path_gxx}")
+        execute_process(
+            COMMAND "${_cuhll_path_gxx}" -dumpfullversion -dumpversion
+            OUTPUT_VARIABLE _cuhll_path_gxx_ver
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        string(REGEX MATCH "^[0-9.]+" _cuhll_path_gxx_ver "${_cuhll_path_gxx_ver}")
+    endif()
+
+    if(NOT _cuhll_path_gxx OR _cuhll_path_gxx_ver VERSION_LESS ${CUHLL_GCC_FLOOR_PREPROJECT})
+        # Glob standard install layouts. file(GLOB) silently yields an empty
+        # list for paths that don't exist, so this is safe on any distro.
+        set(_cuhll_gxx_candidates)
+        file(GLOB _cuhll_g1 "/apps/compilers/gcc/*/bin/g++")          # Lmod / HPC
+        file(GLOB _cuhll_g2 "/opt/rh/gcc-toolset-*/root/usr/bin/g++") # RHEL devtoolset
+        file(GLOB _cuhll_g3 "/usr/local/gcc-*/bin/g++")               # manual
+        file(GLOB _cuhll_g4 "/opt/gcc-*/bin/g++")                     # manual
+        list(APPEND _cuhll_gxx_candidates
+            ${_cuhll_g1} ${_cuhll_g2} ${_cuhll_g3} ${_cuhll_g4})
+        # Versioned system packages (g++-12 etc on Debian/Ubuntu, Rocky).
+        foreach(_v 15 14 13 12 11)
+            find_program(_cuhll_gv g++-${_v} NO_CACHE)
+            if(_cuhll_gv)
+                list(APPEND _cuhll_gxx_candidates "${_cuhll_gv}")
+            endif()
+            unset(_cuhll_gv)
+        endforeach()
+
+        set(_cuhll_best_gxx "")
+        set(_cuhll_best_ver "0")
+        foreach(_c IN LISTS _cuhll_gxx_candidates)
+            if(NOT EXISTS "${_c}")
+                continue()
+            endif()
+            execute_process(
+                COMMAND "${_c}" -dumpfullversion -dumpversion
+                OUTPUT_VARIABLE _cv
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+                RESULT_VARIABLE _crc)
+            if(NOT _crc EQUAL 0)
+                continue()
+            endif()
+            string(REGEX MATCH "^[0-9.]+" _cv "${_cv}")
+            if(_cv VERSION_LESS ${CUHLL_GCC_FLOOR_PREPROJECT})
+                continue()
+            endif()
+            if(_cv VERSION_GREATER _cuhll_best_ver)
+                set(_cuhll_best_ver "${_cv}")
+                set(_cuhll_best_gxx "${_c}")
+            endif()
+        endforeach()
+
+        if(_cuhll_best_gxx)
+            # Sentinel for downstream link-options logic: when we auto-
+            # discover a non-system gcc, its libstdc++ won't be on a
+            # fresh shell's LD_LIBRARY_PATH at runtime, so executables
+            # must be statically linked to be portable.
+            set(CUHLL_AUTODISCOVERED_CXX ON)
+            set(CMAKE_CXX_COMPILER "${_cuhll_best_gxx}" CACHE FILEPATH
+                "C++ compiler (auto-discovered by cuHLL)" FORCE)
+            # Clear any CXX env-derived flags (e.g. conda's "-pthread -B
+            # /apps/python/X/compiler_compat") so they don't bleed into the
+            # newly-discovered compiler's invocations.
+            set(CMAKE_CXX_COMPILER_ARG1 "" CACHE STRING
+                "Args1 cleared by cuHLL after compiler override" FORCE)
+            set(ENV{CXX} "${_cuhll_best_gxx}")
+            # Also pin nvcc's host compiler so it doesn't pick up the
+            # still-on-PATH conda g++. Otherwise nvcc reports e.g.
+            # `host compiler GNU 10.3.0` and host code fails C++17 checks.
+            set(CMAKE_CUDA_HOST_COMPILER "${_cuhll_best_gxx}" CACHE FILEPATH
+                "CUDA host compiler (auto-discovered by cuHLL)" FORCE)
+            # Derive matching gcc by name substitution; only set if it exists.
+            string(REPLACE "/g++" "/gcc" _cuhll_best_gcc "${_cuhll_best_gxx}")
+            if(EXISTS "${_cuhll_best_gcc}")
+                set(CMAKE_C_COMPILER "${_cuhll_best_gcc}" CACHE FILEPATH
+                    "C compiler (auto-discovered by cuHLL)" FORCE)
+                set(CMAKE_C_COMPILER_ARG1 "" CACHE STRING
+                    "Args1 cleared by cuHLL after compiler override" FORCE)
+                set(ENV{CC} "${_cuhll_best_gcc}")
+            endif()
+            if(_cuhll_path_gxx)
+                message(STATUS
+                    "cuHLL: PATH g++ ${_cuhll_path_gxx_ver} is below floor "
+                    "${CUHLL_GCC_FLOOR_PREPROJECT}; auto-discovered g++ "
+                    "${_cuhll_best_ver} at ${_cuhll_best_gxx}. "
+                    "Override with -DCMAKE_CXX_COMPILER=... or "
+                    "-DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF.")
+            else()
+                message(STATUS
+                    "cuHLL: no g++ on PATH; auto-discovered g++ "
+                    "${_cuhll_best_ver} at ${_cuhll_best_gxx}. "
+                    "Override with -DCMAKE_CXX_COMPILER=... or "
+                    "-DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF.")
+            endif()
+        endif()
+        unset(_cuhll_gxx_candidates)
+        unset(_cuhll_best_gxx)
+        unset(_cuhll_best_ver)
+    endif()
+    unset(_cuhll_path_gxx)
+    unset(_cuhll_path_gxx_ver)
+endif()
+
+# --- CUDA discovery ----------------------------------------------------------
+if(CUHLL_AUTODISCOVER_TOOLCHAIN
+   AND NOT DEFINED CMAKE_CUDA_COMPILER
+   AND NOT DEFINED CUDAToolkit_ROOT
+   AND "$ENV{CUDACXX}" STREQUAL "")
+    find_program(_cuhll_path_nvcc nvcc NO_CACHE)
+    set(_cuhll_path_nvcc_ver "0")
+    if(_cuhll_path_nvcc)
+        execute_process(
+            COMMAND "${_cuhll_path_nvcc}" --version
+            OUTPUT_VARIABLE _cuhll_nvcc_out
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET)
+        # nvcc --version prints lines like:
+        #   Cuda compilation tools, release 12.8, V12.8.61
+        string(REGEX MATCH "release ([0-9]+\\.[0-9]+)" _ "${_cuhll_nvcc_out}")
+        set(_cuhll_path_nvcc_ver "${CMAKE_MATCH_1}")
+    endif()
+
+    if(NOT _cuhll_path_nvcc OR _cuhll_path_nvcc_ver VERSION_LESS ${CUHLL_CUDA_FLOOR_PREPROJECT})
+        set(_cuhll_nvcc_candidates)
+        file(GLOB _cuhll_n1 "/usr/local/cuda*/bin/nvcc")              # NVIDIA installer
+        file(GLOB _cuhll_n2 "/apps/compilers/cuda/*/bin/nvcc")        # Lmod / HPC
+        file(GLOB _cuhll_n3 "/opt/cuda*/bin/nvcc")                    # Arch / manual
+        list(APPEND _cuhll_nvcc_candidates ${_cuhll_n1} ${_cuhll_n2} ${_cuhll_n3})
+
+        set(_cuhll_best_nvcc "")
+        set(_cuhll_best_cudaver "0")
+        foreach(_n IN LISTS _cuhll_nvcc_candidates)
+            if(NOT EXISTS "${_n}")
+                continue()
+            endif()
+            execute_process(
+                COMMAND "${_n}" --version
+                OUTPUT_VARIABLE _nv_out
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+                ERROR_QUIET
+                RESULT_VARIABLE _nrc)
+            if(NOT _nrc EQUAL 0)
+                continue()
+            endif()
+            string(REGEX MATCH "release ([0-9]+\\.[0-9]+)" _ "${_nv_out}")
+            set(_nv "${CMAKE_MATCH_1}")
+            if(_nv VERSION_LESS ${CUHLL_CUDA_FLOOR_PREPROJECT})
+                continue()
+            endif()
+            if(_nv VERSION_GREATER _cuhll_best_cudaver)
+                set(_cuhll_best_cudaver "${_nv}")
+                set(_cuhll_best_nvcc "${_n}")
+            endif()
+        endforeach()
+
+        if(_cuhll_best_nvcc)
+            # Point CMake's CUDAToolkit/CUDA-language discovery at this prefix.
+            get_filename_component(_cuhll_cuda_root "${_cuhll_best_nvcc}" DIRECTORY)
+            get_filename_component(_cuhll_cuda_root "${_cuhll_cuda_root}" DIRECTORY)
+            set(CMAKE_CUDA_COMPILER "${_cuhll_best_nvcc}" CACHE FILEPATH
+                "CUDA compiler (auto-discovered by cuHLL)" FORCE)
+            set(CUDAToolkit_ROOT "${_cuhll_cuda_root}" CACHE PATH
+                "CUDA toolkit root (auto-discovered by cuHLL)" FORCE)
+            if(_cuhll_path_nvcc)
+                message(STATUS
+                    "cuHLL: PATH nvcc ${_cuhll_path_nvcc_ver} is below floor "
+                    "${CUHLL_CUDA_FLOOR_PREPROJECT}; auto-discovered CUDA "
+                    "${_cuhll_best_cudaver} at ${_cuhll_cuda_root}. "
+                    "Override with -DCUDAToolkit_ROOT=... or "
+                    "-DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF.")
+            else()
+                message(STATUS
+                    "cuHLL: no nvcc on PATH; auto-discovered CUDA "
+                    "${_cuhll_best_cudaver} at ${_cuhll_cuda_root}. "
+                    "Override with -DCUDAToolkit_ROOT=... or "
+                    "-DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF.")
+            endif()
+        endif()
+        unset(_cuhll_nvcc_candidates)
+        unset(_cuhll_best_nvcc)
+        unset(_cuhll_best_cudaver)
+    endif()
+    unset(_cuhll_path_nvcc)
+    unset(_cuhll_path_nvcc_ver)
+endif()
+
+# -----------------------------------------------------------------------------
 # Workaround: conda-bundled toolchain interfering with separately-installed
 # gcc. Two distinct symptoms, one root cause (conda Python module activates
 # its sysroot first):
@@ -240,6 +466,41 @@ project(cuHLL
 unset(_cuhll_project_version)
 
 # -----------------------------------------------------------------------------
+# Toolchain floor checks
+#
+# Fail fast — with an actionable message — if the host compiler or CUDA
+# Toolkit on PATH is older than what cuco / our CUDA TUs need. Without
+# these checks, an under-spec toolchain falls through to a deep CUDA
+# compile error (e.g. `identifier "TIME_UTC" is undefined` for CUDA 13 +
+# GCC < 11) that's hard for a new user to diagnose. We intentionally do
+# NOT try to download GCC or the CUDA Toolkit — both are driver/glibc-
+# coupled and must come from the host system; PyTorch / CuPy / RAPIDS
+# all take the same stance. CMake itself is auto-fetched by scikit-build-
+# core when too old (see pyproject.toml's `cmake.version`).
+# -----------------------------------------------------------------------------
+set(CUHLL_MIN_GCC_VERSION  11)
+set(CUHLL_MIN_CUDA_VERSION 12.0)
+
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU"
+   AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS ${CUHLL_MIN_GCC_VERSION})
+    message(FATAL_ERROR
+        "cuHLL: GCC ${CMAKE_CXX_COMPILER_VERSION} is too old. "
+        "Need GCC >= ${CUHLL_MIN_GCC_VERSION} for C++17 + recent libstdc++ "
+        "and to avoid CUDA 13 host-header incompatibilities. "
+        "On HPC: `module load gcc/12.2.0` (or newer). "
+        "Locally: install a newer GCC from your distro.")
+endif()
+
+if(CMAKE_CUDA_COMPILER_VERSION VERSION_LESS ${CUHLL_MIN_CUDA_VERSION})
+    message(FATAL_ERROR
+        "cuHLL: CUDA Toolkit ${CMAKE_CUDA_COMPILER_VERSION} is too old. "
+        "Need CUDA >= ${CUHLL_MIN_CUDA_VERSION} (cuco::hyperloglog and our "
+        "device-scope atomics rely on toolkit features added in 12.x). "
+        "On HPC: `module load cuda/12.8.1` (or newer). "
+        "Locally: install a newer CUDA Toolkit from NVIDIA.")
+endif()
+
+# -----------------------------------------------------------------------------
 # Language standards + warnings
 # -----------------------------------------------------------------------------
 set(CMAKE_CXX_STANDARD 17)
@@ -311,6 +572,27 @@ target_include_directories(cuco_probe PRIVATE include)
 target_link_libraries(cuco_probe PRIVATE cuco::cuco CUDA::cudart)
 
 # -----------------------------------------------------------------------------
+# Statically link libstdc++/libgcc into the executables whenever we ended
+# up on a non-system gcc (conda Python on PATH or auto-discovery picked
+# something newer than /usr). Without this, running the binary from a
+# fresh shell hits `libstdc++.so.6: GLIBCXX_3.4.xx not found`. ~1-2 MB
+# per binary; -DCUHLL_STATIC_LIBSTDCXX=OFF to opt out.
+# -----------------------------------------------------------------------------
+if(NOT DEFINED CUHLL_STATIC_LIBSTDCXX)
+    if(CUHLL_CONDA_LD_WORKAROUND OR CUHLL_AUTODISCOVERED_CXX)
+        set(CUHLL_STATIC_LIBSTDCXX ON)
+    else()
+        set(CUHLL_STATIC_LIBSTDCXX OFF)
+    endif()
+endif()
+if(CUHLL_STATIC_LIBSTDCXX)
+    message(STATUS
+        "cuHLL: static-linking libstdc++ and libgcc into executables "
+        "for runtime portability (disable with -DCUHLL_STATIC_LIBSTDCXX=OFF)")
+    target_link_options(cuco_probe PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+# -----------------------------------------------------------------------------
 # cuhll_core: shared static library containing everything the cuhll executable
 # and the milestone (e) tests need. Tests link against this rather than
 # recompiling each source from scratch.
@@ -319,8 +601,6 @@ add_library(cuhll_core STATIC
     src/fasta.cpp
     src/sketch.cu
     src/kmer_kernel.cu
-    src/kmer_kernel_cb2.cu
-    src/cb2.cpp
     src/hll_file.cpp
     src/pipeline.cu
     src/concurrent.cpp
@@ -341,18 +621,15 @@ target_link_libraries(cuhll PRIVATE cuhll_core)
 set_target_properties(cuhll PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
-
-# -----------------------------------------------------------------------------
-# cuhll_pack tool: offline FASTA -> .cb2 converter (Tier 1).
-# -----------------------------------------------------------------------------
-add_executable(cuhll_pack tools/cuhll_pack.cpp)
-target_link_libraries(cuhll_pack PRIVATE cuhll_core)
+if(CUHLL_STATIC_LIBSTDCXX)
+    target_link_options(cuhll PRIVATE -static-libstdc++ -static-libgcc)
+endif()
 
 # -----------------------------------------------------------------------------
 # Tests (CTest)
 #
 # Defaults OFF so end users get a fast `cmake .. && make -j` that builds
-# only the runtime artifacts (cuhll, cuhll_pack, cuco_probe) plus the
+# only the runtime artifacts (cuhll, cuco_probe) plus the
 # cuhll_core library. Developers and CI opt in with -DCUHLL_BUILD_TESTS=ON.
 #
 # Variable is project-namespaced (matches CUCO_BUILD_TESTS / CCCL_ENABLE_TESTING)
@@ -407,13 +684,10 @@ if(CUHLL_BUILD_PYTHON)
         CUDA_SEPARABLE_COMPILATION  ON
     )
 
-    # When a conda Python's old libstdc++ would shadow gcc's at import
-    # time (see the conda-toolchain workaround above project()), embed
-    # libstdc++/libgcc statically into the binding so its runtime
-    # behaviour is independent of whichever libstdc++ the host Python
-    # ships. Adds ~1–2 MB to the .so but eliminates the GLIBCXX_3.4.xx
-    # not-found class of import errors entirely.
-    if(CUHLL_CONDA_LD_WORKAROUND)
+    # Same static-link policy as the executables above — fires for the
+    # same reason (conda Python's libstdc++ would shadow gcc's at import
+    # time when the binding loads a non-system gcc's libstdc++).
+    if(CUHLL_STATIC_LIBSTDCXX)
         target_link_options(_bindings PRIVATE
             -static-libstdc++ -static-libgcc)
     endif()

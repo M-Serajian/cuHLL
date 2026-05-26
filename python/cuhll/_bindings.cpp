@@ -143,8 +143,15 @@ PYBIND11_MODULE(_bindings, m) {
           py::arg("k"), py::arg("precision"), py::arg("canonical"),
           "Concurrent per-genome path: sketches every input FASTA, writes "
           "<stem>.hll into output_dir, and returns the union cardinality "
-          "as a uint64. The Python `cuhll.estimate_union` / "
-          "`cuhll.sketch_to_dir` wrappers route through this.");
+          "as a uint64. The Python `cuhll.sketch_to_dir` wrapper routes "
+          "through this when per-genome files are wanted.");
+
+    m.def("union_estimate_auto", &cuhll::union_estimate_auto,
+          py::arg("paths"), py::arg("k"),
+          py::arg("precision") = cuhll::kDefaultPrecision,
+          py::arg("canonical") = true,
+          "Union cardinality across FASTAs via one shared GPU sketch "
+          "(atomicMax). No per-genome files, no merge.");
 
     // ------------------------------------------------------------------
     // .hll file I/O.

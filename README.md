@@ -21,8 +21,19 @@ single L4 GPU** via the concurrent per-genome pipeline.
 
 ## 📦 Install
 
-Build from source — the supported path today. You need a CUDA Toolkit
-(`nvcc`) and a C++ compiler (GCC 11+) available at build time:
+### Easiest: prebuilt wheel from PyPI (coming with first tag)
+
+```bash
+pip install cuhll
+```
+
+This is the cuDF-style path — a precompiled wheel with `libcudart.so.12`
+bundled. **No CUDA Toolkit, no compiler, no module loads needed.** Only
+an NVIDIA driver. Once the first `v*` tag is pushed, GitHub Actions at
+[.github/workflows/wheels.yml](.github/workflows/wheels.yml) publishes
+wheels for Python 3.9–3.13 on Linux x86_64.
+
+### Build from source (everything auto-discovered)
 
 ```bash
 git clone https://github.com/M-Serajian/cuHLL.git
@@ -30,25 +41,42 @@ cd cuHLL
 pip install .
 ```
 
-That's it — `import cuhll` works in Python. On HPC systems, load the
-modules first (e.g. `module load python/3.10 cuda/12.8.1 gcc/14.2.0`).
-For a C++/CLI-only build (no Python) see
-[Build from source (CMake)](#-build-from-source-cmake) below.
+That's it — `import cuhll` works in Python.
 
-### PyPI install (coming soon)
+cuHLL's CMake auto-discovers the toolchain it needs, so this works even
+without loading any modules — as long as a GCC ≥ 11 and CUDA Toolkit
+≥ 12.0 are *installed somewhere* on the system. Specifically:
+
+- **CMake** is always auto-fetched (≥ 4.0) by the pip build env.
+- **GCC** is searched in `/apps/compilers/gcc/*`, `/opt/rh/gcc-toolset-*`,
+  `/usr/local/gcc-*`, `/opt/gcc-*`, and versioned system packages
+  (`g++-12`, `g++-13`, etc) when the PATH version is missing or below
+  floor.
+- **CUDA Toolkit** is searched in `/usr/local/cuda*`, `/apps/compilers/cuda/*`,
+  `/opt/cuda*` under the same conditions.
+- A clear error message tells you what to install if nothing is found.
+
+**On HPC systems**, you can also explicitly `module load gcc/14.2.0
+cuda/12.8.1` if you want to pin specific versions — discovery is a no-op
+when PATH versions meet the floor. Don't load a `cmake` module; pip
+auto-fetches one, and a stale system cmake can interfere (see
+Troubleshooting).
+
+**Override / opt-out flags:**
 
 ```bash
-pip install cuhll       # not yet active — wheel pipeline ready, first release pending
+-DCMAKE_CXX_COMPILER=/path/to/g++             # supply your own compiler
+-DCUDAToolkit_ROOT=/path/to/cuda              # supply your own CUDA
+-DCUHLL_AUTODISCOVER_TOOLCHAIN=OFF            # disable scanning entirely
 ```
 
-Once the first tagged release is published, `pip install cuhll` will
-fetch a pre-built wheel that bundles `libcudart.so.12` — no CUDA
-toolkit, no compiler, no module loads needed. Only requirement on the
-target machine: an **NVIDIA driver**. The cibuildwheel pipeline that
-builds these wheels is already in place at
-[`.github/workflows/wheels.yml`](.github/workflows/wheels.yml); it
-triggers on `git tag v*` and ships wheels for Python 3.9–3.13 on Linux
-x86_64.
+**Python on HPC:** some `python/X` modules ship without a working `ssl`
+module and can't reach PyPI. If `pip install` fails with `Can't connect
+to HTTPS URL because the SSL module is not available`, switch to system
+Python (`/usr/bin/python3`) or a conda/venv environment.
+
+For a C++/CLI-only build (no Python) see
+[Build from source (CMake)](#-build-from-source-cmake) below.
 
 ---
 
@@ -299,7 +327,6 @@ cmake --build . -j
 
 Output binaries land in `build/bin/`:
 - `cuhll` — main CLI
-- `cuhll_pack` — FASTA → `.cb2` packed-binary converter
 - `cuco_probe` — minimal sm_70+ smoke test
 
 Common flags:
@@ -332,14 +359,6 @@ cuhll --k 31 --output-dir sketches/ *.fa            # one .hll per input
 | `--output-dir <dir>` | (none) | write per-genome `.hll` files; otherwise prints union estimate |
 | `--chunk-mb <int>` | 64 | streaming chunk size |
 
-### `cuhll_pack` (offline FASTA → `.cb2`)
-
-`.cb2` is cuHLL's filtered 2-bit-per-base format for repeat sketching:
-```bash
-cuhll_pack input.fasta out.cb2
-cuhll --k 31 out.cb2                                # ~3× faster than re-parsing FASTA
-```
-
 ---
 
 ## 📊 `.hll` file format
@@ -370,10 +389,10 @@ Same bytes from both Python (`Sketch.write`) and C++ (`cuhll::write_hll`).
 
 | component | minimum | tested | how to get it |
 |---|---|---|---|
-| CUDA Toolkit (`nvcc`) | 12.0 | 12.4, 12.8.1, 12.9.1 | NVIDIA installer / `module load cuda/12.8.1` |
-| GCC / G++ | 11 | 11, 12, 14.2.0 | distro pkg / `module load gcc/14.2.0` |
-| Python | 3.9 | 3.10, 3.12 | system / `module load python/3.10` |
-| CMake | 3.30 | 3.30.5, 4.3 | auto-fetched by pip's build env |
+| CUDA Toolkit (`nvcc`) | 12.0 | 12.4, 12.8.1, 12.9.1, 13.2.1 | NVIDIA installer / `module load cuda/12.8.1` (enforced upfront — clear error if too old) |
+| GCC / G++ | 11 | 11, 12, 14.2.0 | distro pkg / `module load gcc/14.2.0` (enforced upfront — clear error if too old) |
+| Python | 3.9 | 3.10, 3.12 | system / venv / conda (HPC `python/X` modules sometimes ship without SSL — use system Python if pip can't reach PyPI) |
+| CMake | 4.0 | 4.0+ | **auto-fetched by pip's build env** — don't load a `cmake` module; if your system cmake is < 4.0, scikit-build-core fetches a compatible one |
 | GPU compute capability | sm_70 (Volta) | sm_89 (L4) | runtime only — no GPU needed at build time |
 | OS | Linux x86_64 | RHEL 9 | — |
 
@@ -444,7 +463,10 @@ CUHLL_KMC_BIN=$(which kmc) CUHLL_KMC_TOOLS_BIN=$(which kmc_tools) \
 | symptom | cause | fix |
 |---|---|---|
 | `Failed to find nvcc.` | CUDA toolkit not on PATH | `module load cuda/12.8.1` then re-run |
-| `error: identifier "TIME_UTC" is undefined` | CUDA 13 + GCC ≤ 10 | `module load gcc/12+` |
+| `cuHLL: GCC X.Y is too old` | GCC < 11 | `module load gcc/12.2.0` (or newer); locally install a newer GCC |
+| `cuHLL: CUDA Toolkit X.Y is too old` | CUDA < 12.0 | `module load cuda/12.8.1` (or newer) |
+| `CMake X.Y or higher is required` (from rapids-cmake) | stale `cmake` module shadowing pip's auto-fetched cmake | `module unload cmake`; pip's build env will fetch a compatible cmake. Or pass `--config-settings=cmake.version=">=3.30"` if you've supplied a cmake >= 4.0 yourself |
+| `Can't connect to HTTPS URL because the SSL module is not available` | HPC `python/X` module compiled without OpenSSL | use `/usr/bin/python3` or a conda/venv environment |
 | `libcudart.so.12: cannot open shared object file` (or `.so.13`) | wheel's CUDA major ≠ runtime's | rebuild OR load matching `cuda/<major>.x` module |
 | `conda/bin/ld: ... undefined reference to ...@GLIBC_2.34` | conda Python's bundled `ld` shadows system linker | auto-detected; CMake injects `-B /usr/bin/`. Disable with `-DCUHLL_KEEP_CONDA_LD=ON` |
 | `ImportError: ...libstdc++.so.6: GLIBCXX_3.4.32 not found` | conda Python's old libstdc++ wins via DT_RPATH | auto-detected; bindings link libstdc++ statically |

@@ -504,21 +504,13 @@ def estimate_union(
         return estimate(paths[0], k=k, precision=precision,
                         canonical=canonical, verbose=verbose)
 
-    # Stem-collision fallback: if two inputs share a basename stem the
-    # concurrent path would overwrite .hll files in the tempdir, so we
-    # fall back to per-input sketching + Python merge (still concurrent
-    # via sketch_many, just without the C++-side union shortcut).
-    stems = [p.stem for p in paths]
-    if len(set(stems)) != len(stems):
-        return sketch_union(paths, k=k, precision=precision,
-                            canonical=canonical, verbose=verbose).estimate()
-
-    with tempfile.TemporaryDirectory(prefix="cuhll_estimate_union_") as td:
-        with _silence_native_stdout(verbose):
-            return int(_core.sketch_per_genome_auto(
-                [str(p) for p in paths], td,
-                int(k), int(precision), bool(canonical),
-            ))
+    # Shared-sketch concurrent path: every input stream atomicMax-es into
+    # one GPU sketch. No tempdir, no per-genome .hll writes, no merge.
+    with _silence_native_stdout(verbose):
+        return int(_core.union_estimate_auto(
+            [str(p) for p in paths],
+            int(k), int(precision), bool(canonical),
+        ))
 
 
 class SketchDirResult(Dict[str, str]):

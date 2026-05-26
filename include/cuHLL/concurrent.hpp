@@ -80,4 +80,13 @@ std::uint64_t sketch_per_genome_auto(
     int precision_p,
     bool canonical = true);
 
+// Union-only entry. All streams hammer one shared sketch via atomicMax;
+// no per-genome files, no merge step. Returns the same value as
+// sketch_per_genome_auto on the same input.
+std::uint64_t union_estimate_auto(
+    const std::vector<std::string>& fasta_paths,
+    int k,
+    int precision_p,
+    bool canonical = true);
+
 } // namespace cuhll

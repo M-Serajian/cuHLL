@@ -45,3 +45,4 @@ wheels/
 .*.swp
 .*.swo
 
+tmp/*

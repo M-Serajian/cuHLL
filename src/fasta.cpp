@@ -64,9 +64,16 @@ std::string read_fasta_concat(const std::string& path) {
     const char* const base = raw.data();
     const char* const end  = base + raw.size();
     const char* p = base;
+    // Inject 'N' between records so k-mers can't span unrelated sequences.
+    // Same boundary policy as FastaChunkReader.
+    bool first_record_seen = false;
 
     while (p < end) {
         if (*p == '>') {
+            if (first_record_seen) {
+                out.push_back('N');
+            }
+            first_record_seen = true;
             // Skip the header line (up to and including the next '\n').
             const char* nl = static_cast<const char*>(
                 std::memchr(p, '\n', static_cast<std::size_t>(end - p)));

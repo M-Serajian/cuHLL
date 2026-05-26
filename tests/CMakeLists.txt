@@ -30,7 +30,6 @@ set(_gpu_tests
     test_tiny_exact
     test_determinism
     test_merge
-    test_cb2_correctness
     test_hll_roundtrip
     test_merge_equivalence
     test_canonical_flag

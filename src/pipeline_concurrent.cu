@@ -388,4 +388,162 @@ std::uint64_t sketch_per_genome_auto(
     return union_est;
 }
 
+// -----------------------------------------------------------------------------
+// Union-only concurrent pipeline. Same reader + stream layout as
+// sketch_per_genome_auto, but every stream's kernel targets one shared
+// sketch — no per-genome registers, no writers, no merge.
+// -----------------------------------------------------------------------------
+namespace {
+
+struct UnionSlot {
+    cudaStream_t stream = nullptr;
+    cudaEvent_t  done   = nullptr;
+    void*        d_in   = nullptr;
+    void*        h_in   = nullptr;
+    bool         busy   = false;
+};
+
+} // namespace
+
+std::uint64_t union_estimate_auto(
+        const std::vector<std::string>& fasta_paths,
+        int k,
+        int precision_p,
+        bool canonical) {
+    if (fasta_paths.empty()) return 0;
+
+    InputSurvey survey = survey_inputs(fasta_paths);
+    HostGpuCaps caps   = probe_host_gpu();
+    fill_gpu_caps(caps);
+    AutoTune at = compute_auto_tune_impl(survey, caps);
+    at.n_writers = 0;  // no per-genome files
+    log_auto_tune(at, survey, caps);
+
+    const int         n_streams    = at.n_streams;
+    const std::size_t d_buf_bytes  = at.bytes_per_stream;
+
+    Sketch union_sketch(precision_p, canonical);
+    auto   ref = union_sketch.impl_ref().sketch.ref();
+
+    std::vector<UnionSlot> slots(n_streams);
+    for (int i = 0; i < n_streams; ++i) {
+        auto& sl = slots[i];
+        CUDA_CHECK(cudaStreamCreate(&sl.stream));
+        CUDA_CHECK(cudaEventCreateWithFlags(&sl.done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaMalloc(&sl.d_in, d_buf_bytes));
+        CUDA_CHECK(cudaHostAlloc(&sl.h_in, d_buf_bytes, cudaHostAllocDefault));
+    }
+
+    struct InputItem { std::size_t idx; std::string path; };
+    MpmcQueue<InputItem>    input_q(fasta_paths.size());
+    MpmcQueue<ParsedGenome> ready_q(static_cast<std::size_t>(std::max(4, n_streams * 2)));
+
+    for (std::size_t i = 0; i < fasta_paths.size(); ++i) {
+        input_q.push({i, fasta_paths[i]});
+    }
+    input_q.close();
+
+    std::vector<std::thread> readers;
+    readers.reserve(at.n_readers);
+    std::atomic<bool> reader_fault{false};
+    std::string       reader_error;
+    std::mutex        reader_error_mu;
+    for (int r = 0; r < at.n_readers; ++r) {
+        readers.emplace_back([&]() {
+            while (true) {
+                auto item = input_q.pop();
+                if (!item) break;
+                try {
+                    std::string bases = read_fasta_concat(item->path);
+                    ready_q.push({item->idx, item->path, std::move(bases)});
+                } catch (const std::exception& e) {
+                    std::lock_guard<std::mutex> g(reader_error_mu);
+                    if (!reader_fault.exchange(true)) reader_error = e.what();
+                    // Push an empty record so the dispatcher's count stays correct.
+                    ready_q.push({item->idx, item->path, std::string{}});
+                }
+            }
+        });
+    }
+
+    std::size_t n_launched  = 0;
+    std::size_t n_completed = 0;
+    const std::size_t target = fasta_paths.size();
+
+    auto drain_slot = [&](int i) {
+        auto& sl = slots[i];
+        if (!sl.busy) return false;
+        if (cudaEventQuery(sl.done) != cudaSuccess) return false;
+        sl.busy = false;
+        ++n_completed;
+        return true;
+    };
+
+    auto launch_slot = [&](int i, ParsedGenome& pg) {
+        auto& sl = slots[i];
+        const std::size_t n = pg.bases.size();
+        if (n > d_buf_bytes) {
+            throw std::runtime_error(
+                "cuHLL union: parsed genome exceeds per-stream buffer");
+        }
+        if (n > 0) std::memcpy(sl.h_in, pg.bases.data(), n);
+        CUDA_CHECK(cudaMemcpyAsync(sl.d_in, sl.h_in, n,
+                                   cudaMemcpyHostToDevice, sl.stream));
+        if (n >= static_cast<std::size_t>(k)) {
+            launch_kmer_extract(static_cast<const char*>(sl.d_in),
+                                static_cast<std::int64_t>(n),
+                                k, ref, sl.stream, canonical);
+        }
+        CUDA_CHECK(cudaEventRecord(sl.done, sl.stream));
+        sl.busy = true;
+        ++n_launched;
+    };
+
+    while (n_completed < target) {
+        bool drained_any = false;
+        for (int i = 0; i < n_streams; ++i) {
+            if (drain_slot(i)) drained_any = true;
+        }
+
+        int free_slot = -1;
+        for (int i = 0; i < n_streams; ++i) {
+            if (!slots[i].busy) { free_slot = i; break; }
+        }
+        if (free_slot >= 0 && n_launched < target) {
+            auto pg = ready_q.pop();
+            if (!pg) break;  // readers all exited unexpectedly
+            launch_slot(free_slot, *pg);
+            continue;
+        }
+
+        // Nothing freed and no slot open: block on slot 0's event
+        // instead of spinning.
+        if (!drained_any && free_slot < 0) {
+            CUDA_CHECK(cudaEventSynchronize(slots[0].done));
+            drain_slot(0);
+        }
+    }
+
+    ready_q.close();
+    for (auto& t : readers) t.join();
+
+    if (reader_fault.load()) {
+        throw std::runtime_error("cuHLL union: reader failed: " + reader_error);
+    }
+
+    // Drain any in-flight kernels before reading the registers.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    const std::uint64_t union_est = union_sketch.estimate();
+
+    for (int i = 0; i < n_streams; ++i) {
+        auto& sl = slots[i];
+        if (sl.done)   cudaEventDestroy(sl.done);
+        if (sl.stream) cudaStreamDestroy(sl.stream);
+        if (sl.d_in)   cudaFree(sl.d_in);
+        if (sl.h_in)   cudaFreeHost(sl.h_in);
+    }
+
+    return union_est;
+}
+
 } // namespace cuhll

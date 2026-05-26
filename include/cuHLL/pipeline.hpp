@@ -41,13 +41,4 @@ void sketch_sequences_streaming(Sketch& sketch,
                                 int k,
                                 std::size_t chunk_mb);
 
-// .cb2 path (Tier 1). Streams offline-packed 2-bit files into the same cuco
-// sketch. Cross-file boundaries inject an 'N' window break via the mask.
-// `chunk_mb` is interpreted in **mebibases** of logical sequence per chunk;
-// per-chunk H2D is 3/8 of that in bytes (2 bits packed + 1 bit mask).
-void sketch_sequences_cb2_streaming(Sketch& sketch,
-                                    const std::vector<std::string>& cb2_paths,
-                                    int k,
-                                    std::size_t chunk_mb);
-
 } // namespace cuhll

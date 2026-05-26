@@ -10,16 +10,22 @@
 #include "cuHLL/pipeline.hpp"
 #include "cuHLL/sketch.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <ctime>
+#include <fcntl.h>
 #include <filesystem>
 #include <fstream>
 #include <future>
 #include <iostream>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -36,10 +42,6 @@ std::string lower(std::string s) {
     return s;
 }
 
-bool has_cb2_ext(const std::string& p) {
-    return lower(std::filesystem::path(p).extension().string()) == ".cb2";
-}
-
 bool has_fasta_ext(const std::string& p) {
     const auto e = lower(std::filesystem::path(p).extension().string());
     return e == ".fasta" || e == ".fa" || e == ".fna";
@@ -52,84 +54,131 @@ bool has_gzipped_fasta_ext(const std::string& p) {
     return inner == ".fa" || inner == ".fna" || inner == ".fasta";
 }
 
-std::string cb2_colocated_path(const std::string& fasta_path) {
-    std::filesystem::path p(fasta_path);
-    const auto parent = p.parent_path().string();
-    return (parent.empty() ? "." : parent) + "/" + p.stem().string() + ".cb2";
-}
-
-std::size_t file_size_bytes(const std::string& path) {
-    std::error_code ec;
-    const auto sz = std::filesystem::file_size(path, ec);
-    return ec ? 0 : static_cast<std::size_t>(sz);
-}
-
-bool is_newer_than(const std::string& a, const std::string& b) {
-    std::error_code eca, ecb;
-    const auto ta = std::filesystem::last_write_time(a, eca);
-    const auto tb = std::filesystem::last_write_time(b, ecb);
-    if (eca || ecb) return false;
-    return ta > tb;
-}
-
-// Classify one input path into a (backend, canonical-path) pair.
-// Backend: 0 = FASTA, 1 = cb2. Throws for unsupported (e.g. gzipped) inputs.
-// Rules:
-//   * `--cb2` override: treat every input as .cb2 regardless of extension.
-//   * *.cb2 -> cb2 backend.
-//   * *.fasta/*.fa/*.fna -> FASTA backend. If the file is >= threshold_mb
-//     AND a <stem>.cb2 exists alongside AND the .cb2 is not older than the
-//     FASTA, use that .cb2 instead (auto-accelerate).
-//   * *.fa.gz / *.fasta.gz / *.fna.gz -> explicit error (compressed not
-//     yet supported).
-std::pair<int, std::string> classify_input(const std::string& path,
-                                            bool force_cb2,
-                                            int threshold_mb) {
-    if (force_cb2) return {1, path};
+// Validate one input path. Throws for unsupported (e.g. gzipped) or
+// unknown extensions; returns the path otherwise.
+std::string validate_input(const std::string& path) {
     if (has_gzipped_fasta_ext(path)) {
         throw std::runtime_error("compressed FASTA not yet supported; gunzip first: "
                                  + path);
     }
-    if (has_cb2_ext(path)) return {1, path};
-    if (has_fasta_ext(path)) {
-        const std::size_t sz_mb = file_size_bytes(path) / (1024ULL * 1024ULL);
-        if (threshold_mb > 0 && sz_mb >= static_cast<std::size_t>(threshold_mb)) {
-            const std::string cob = cb2_colocated_path(path);
-            if (std::filesystem::exists(cob) && is_newer_than(cob, path)) {
-                return {1, cob};
-            }
-        }
-        return {0, path};
+    if (!has_fasta_ext(path)) {
+        throw std::runtime_error("unknown input extension (expected .fasta/.fa/.fna): "
+                                 + path);
     }
-    throw std::runtime_error("unknown input extension (expected .fasta/.fa/.fna or .cb2): "
-                             + path);
+    return path;
 }
+
+// --tmpdir > $TMPDIR > /tmp. Returns the parent; TempDir mkdtemp's a
+// unique subdir under it.
+std::string resolve_tmpdir_base(const std::string& cli_tmpdir) {
+    if (!cli_tmpdir.empty()) return cli_tmpdir;
+    if (const char* env = std::getenv("TMPDIR"); env && env[0] != '\0') {
+        return std::string(env);
+    }
+    return "/tmp";
+}
+
+// RAII tempdir at <base>/cuhll-<pid>-<random6>/. mkdtemp(3) creates it
+// atomically (no race even with many processes on the same shared FS)
+// at mode 0700. Destructor removes it best-effort; a SIGKILL leaves it
+// behind for tmpwatch to reap.
+class TempDir {
+public:
+    explicit TempDir(const std::string& base_dir) {
+        // mkdtemp wants a mutable buffer ending in "XXXXXX".
+        std::string templ = base_dir + "/cuhll-" +
+                            std::to_string(::getpid()) + "-XXXXXX";
+        std::vector<char> buf(templ.begin(), templ.end());
+        buf.push_back('\0');
+        if (::mkdtemp(buf.data()) == nullptr) {
+            const int err = errno;
+            throw std::runtime_error(
+                std::string("cuHLL: mkdtemp(") + templ + ") failed: "
+                + std::strerror(err)
+                + ". Pass --tmpdir <dir> to point at a writable parent.");
+        }
+        path_ = std::filesystem::path(buf.data());
+    }
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);  // best-effort
+    }
+    TempDir(const TempDir&) = delete;
+    TempDir& operator=(const TempDir&) = delete;
+    const std::filesystem::path& path() const { return path_; }
+private:
+    std::filesystem::path path_;
+};
+
+// dup2 /dev/null over fd 1 to swallow printf/std::cout from C++ callees,
+// reverse on release(). The fflush before each dup2 is load-bearing —
+// without it, libc-buffered bytes leak across the swap.
+class StdoutSuppressor {
+public:
+    StdoutSuppressor() = default;
+    ~StdoutSuppressor() { release(); }
+    StdoutSuppressor(const StdoutSuppressor&) = delete;
+    StdoutSuppressor& operator=(const StdoutSuppressor&) = delete;
+
+    void engage() {
+        if (engaged_) return;
+        std::fflush(stdout);
+        std::cout.flush();
+        saved_fd_   = ::dup(STDOUT_FILENO);
+        devnull_fd_ = ::open("/dev/null", O_WRONLY);
+        if (saved_fd_ < 0 || devnull_fd_ < 0) {
+            if (devnull_fd_ >= 0) ::close(devnull_fd_);
+            if (saved_fd_   >= 0) ::close(saved_fd_);
+            saved_fd_ = devnull_fd_ = -1;
+            return;  // best-effort: skip suppression
+        }
+        ::dup2(devnull_fd_, STDOUT_FILENO);
+        engaged_ = true;
+    }
+    void release() {
+        if (!engaged_) return;
+        std::fflush(stdout);
+        std::cout.flush();
+        ::dup2(saved_fd_, STDOUT_FILENO);
+        ::close(saved_fd_);
+        ::close(devnull_fd_);
+        saved_fd_ = devnull_fd_ = -1;
+        engaged_ = false;
+    }
+private:
+    bool engaged_   = false;
+    int  saved_fd_  = -1;
+    int  devnull_fd_ = -1;
+};
 
 void print_usage(const char* prog) {
     std::fprintf(stderr,
         "usage: %s --k <K> [options] <input> [<input> ...]\n"
         "\n"
-        "Inputs can be a mix of:\n"
-        "  *.fasta / *.fa / *.fna   (plain FASTA)\n"
-        "  *.cb2                    (offline 2-bit packed; see cuhll_pack)\n"
-        "\n"
-        "Auto-select: when a FASTA's size is >= --cb2-threshold-mb and a\n"
-        "<stem>.cb2 sibling exists and is newer than the FASTA, cuhll uses the\n"
-        ".cb2 transparently. Otherwise the FASTA path is used.\n"
+        "Inputs: plain FASTA files (*.fasta / *.fa / *.fna). Gzipped FASTA is\n"
+        "not yet supported.\n"
         "\n"
         "Options:\n"
         "  --k            k-mer length (required; %d <= k <= %d)\n"
         "  --precision    HLL precision (default %d; range %d..%d)\n"
         "  --chunk-mb     streaming chunk size in MiB (default %zu; min 1)\n"
-        "  --cb2-threshold-mb N   auto-use colocated .cb2 at or above this size\n"
-        "                         (default 100; env CUHLL_CB2_THRESHOLD_MB overrides)\n"
-        "  --cb2          force .cb2 interpretation of every input\n"
         "  --canonical    (default) count canonical k-mers (min(fwd, rc))\n"
         "  --no-canonical count forward-strand k-mers only\n"
         "  --per-genome   emit one estimate per input plus a final UNION line\n"
         "  --output-dir D write one <stem>.hll per input to D (implies --per-genome)\n"
+        "  --keep-sketches\n"
+        "                 like --output-dir but auto-names the directory as\n"
+        "                 ./cuhll_sketches_<YYYYMMDD-HHMMSS>_pid<PID>/ (implies\n"
+        "                 --per-genome). Default behavior (neither flag) discards\n"
+        "                 per-genome sketches in a tempdir after computing the union.\n"
+        "  --tmpdir DIR   parent directory for transient per-genome sketches when\n"
+        "                 neither --keep-sketches nor --output-dir is given. The\n"
+        "                 subdirectory is created via mkdtemp(3) (atomic, mode 0700,\n"
+        "                 collision-safe across concurrent processes/GPUs). Precedence:\n"
+        "                 --tmpdir > $TMPDIR > /tmp. Useful on HPC where /tmp may be\n"
+        "                 small; point at /blue/$GROUP/scratch for million-genome panels.\n"
         "  --list F       read input paths from manifest F (one path per line)\n"
-        "  --verbose      print per-stage timings + routing decisions to stderr\n"
+        "  --verbose      print per-stage timings to stderr\n"
         "\n"
         "Output: one integer per line on stdout. Default mode emits a single line\n"
         "(the union cardinality); --per-genome emits <path>\\t<est> per input plus\n"
@@ -154,9 +203,12 @@ int main(int argc, char** argv) {
     int chunk_mb = static_cast<int>(cuhll::kDefaultChunkMB);
     bool verbose = false;
     bool per_genome = false;
-    bool cb2_mode = false;             // legacy override: force cb2 for all inputs
-    int  cb2_threshold_mb = 100;       // FASTA >= this triggers colocated .cb2 reuse
+    bool keep_sketches = false;        // --keep-sketches: auto-name an
+                                       // output dir under cwd and keep
+                                       // the per-genome .hll files there.
     std::string output_dir;            // empty = no per-genome sketch files
+    std::string tmpdir_cli;            // --tmpdir override; empty = use
+                                       // $TMPDIR, then /tmp.
     bool canonical = true;             // L1/L2: canonical k-mers (default)
     int  canonical_flag_seen = 0;      // 0=none, 1=--canonical, 2=--no-canonical
     std::vector<std::string> fasta_paths;
@@ -211,10 +263,10 @@ int main(int argc, char** argv) {
             }
             canonical = false;
             canonical_flag_seen = 2;
-        } else if (arg == "--cb2") {
-            cb2_mode = true;
-        } else if (arg == "--cb2-threshold-mb") {
-            cb2_threshold_mb = std::stoi(need_value(i, "--cb2-threshold-mb"));
+        } else if (arg == "--keep-sketches") {
+            keep_sketches = true;
+        } else if (arg == "--tmpdir") {
+            tmpdir_cli = need_value(i, "--tmpdir");
         } else if (arg == "--output-dir") {
             output_dir = need_value(i, "--output-dir");
         } else if (arg == "--verbose") {
@@ -263,6 +315,21 @@ int main(int argc, char** argv) {
                  canonical ? "canonical" : "non-canonical");
 
     try {
+        // --keep-sketches: pick ./cuhll_sketches_<ts>_pid<PID>/ as the
+        // output dir. PID guards against same-second collisions in
+        // multi-GPU / parallel-batch jobs.
+        if (keep_sketches && output_dir.empty()) {
+            const std::time_t t = std::time(nullptr);
+            std::tm tm_local{};
+            localtime_r(&t, &tm_local);
+            char stamp[32];
+            std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &tm_local);
+            output_dir = std::string("./cuhll_sketches_") + stamp +
+                         "_pid" + std::to_string(::getpid());
+            std::fprintf(stderr, "[cuHLL] --keep-sketches: writing per-genome "
+                                 ".hll files to %s\n", output_dir.c_str());
+        }
+
         const bool write_per_genome_files = !output_dir.empty();
         if (write_per_genome_files) {
             std::error_code ec;
@@ -270,57 +337,58 @@ int main(int argc, char** argv) {
             per_genome = true; // implicit: --output-dir forces per-genome
         }
 
-        // Env override for auto-cb2 threshold.
-        if (const char* env = std::getenv("CUHLL_CB2_THRESHOLD_MB")) {
-            try { cb2_threshold_mb = std::stoi(env); }
-            catch (...) { /* ignore, keep CLI value */ }
-        }
-
-        // Classify each input exactly once; log the routing under --verbose.
-        struct Route { int backend; std::string input_path; std::string display; };
-        std::vector<Route> routed;
-        routed.reserve(fasta_paths.size());
+        // Validate each input exactly once.
+        std::vector<std::string> inputs;
+        inputs.reserve(fasta_paths.size());
         for (const auto& p : fasta_paths) {
-            auto [be, canon] = classify_input(p, cb2_mode, cb2_threshold_mb);
-            routed.push_back({be, canon, p});
-            if (verbose) {
-                std::fprintf(stderr,
-                    "[cuHLL] route %s -> %s via %s\n",
-                    p.c_str(), canon.c_str(),
-                    (be == 1 ? "cb2" : "fasta"));
-            }
+            inputs.push_back(validate_input(p));
         }
 
-        // Milestone (j): automatic concurrent per-genome path.
-        // Fires when --output-dir is set, there are >= 2 inputs, every input
-        // resolves to FASTA, and the internal escape-hatch env var is NOT
-        // set. Produces .hll files byte-for-byte identical to the sequential
-        // path and prints the same per-genome + UNION lines on stdout.
-        if (write_per_genome_files && routed.size() >= 2 &&
+        // Multi-input modes all go through the concurrent pipeline; pure
+        // union mode takes the shared-sketch path, the others go through
+        // sketch_per_genome_auto. Single-input drops to the I2 fast path
+        // below. CUHLL_INTERNAL_FORCE_SEQUENTIAL forces the old sequential
+        // pipeline for benchmarking.
+        if (inputs.size() >= 2 &&
             std::getenv("CUHLL_INTERNAL_FORCE_SEQUENTIAL") == nullptr) {
-            bool all_fasta = true;
-            std::vector<std::string> fa_paths;
-            fa_paths.reserve(routed.size());
-            for (const auto& r : routed) {
-                if (r.backend != 0) { all_fasta = false; break; }
-                fa_paths.push_back(r.input_path);
-            }
-            if (all_fasta) {
-                auto t0 = clk::now();
-                const std::uint64_t union_est = cuhll::sketch_per_genome_auto(
-                    fa_paths, output_dir, k, precision, canonical);
+            const bool pure_union = !per_genome && !write_per_genome_files;
+            auto t0 = clk::now();
+            std::uint64_t union_est = 0;
+
+            if (pure_union) {
+                union_est = cuhll::union_estimate_auto(
+                    inputs, k, precision, canonical);
+                stream_ms = ms_since(t0);
+                std::cout << union_est << std::endl;
+            } else {
+                // Per-genome lines wanted. Use a tempdir if no --output-dir.
+                std::optional<TempDir> td;
+                std::string target_dir = output_dir;
+                if (target_dir.empty()) {
+                    const std::string base = resolve_tmpdir_base(tmpdir_cli);
+                    td.emplace(base);
+                    target_dir = td->path().string();
+                    std::fprintf(stderr,
+                        "[cuHLL] transient sketches: %s (auto-removed on exit; "
+                        "override base with --tmpdir or $TMPDIR; persist via "
+                        "--keep-sketches or --output-dir)\n",
+                        target_dir.c_str());
+                }
+                union_est = cuhll::sketch_per_genome_auto(
+                    inputs, target_dir, k, precision, canonical);
                 stream_ms = ms_since(t0);
                 std::cout << "UNION\t" << union_est << std::endl;
-                if (verbose) {
-                    std::fprintf(stderr,
-                        "[cuHLL] k=%d precision=%d inputs=%zu (concurrent path)\n"
-                        "[cuHLL] timings (ms): concurrent=%.3f total=%.3f\n",
-                        k, precision, fasta_paths.size(),
-                        stream_ms, ms_since(t_total));
-                }
-                return 0;
             }
-            // Else fall through to sequential path (mixed FASTA+cb2).
+
+            if (verbose) {
+                std::fprintf(stderr,
+                    "[cuHLL] k=%d precision=%d inputs=%zu (concurrent path, %s)\n"
+                    "[cuHLL] timings (ms): concurrent=%.3f total=%.3f\n",
+                    k, precision, fasta_paths.size(),
+                    pure_union ? "shared sketch" : "per-genome",
+                    stream_ms, ms_since(t_total));
+            }
+            return 0;
         }
 
         if (per_genome) {
@@ -329,21 +397,15 @@ int main(int argc, char** argv) {
             // With --output-dir, also write <output_dir>/<stem>.hll per input.
             cuhll::Sketch union_sketch(precision, canonical);
             auto t0 = clk::now();
-            for (const auto& r : routed) {
+            for (const auto& path : inputs) {
                 cuhll::Sketch s(precision, canonical);
-                if (r.backend == 1) {
-                    cuhll::sketch_sequences_cb2_streaming(
-                        s, std::vector<std::string>{r.input_path}, k,
-                        static_cast<std::size_t>(chunk_mb));
-                } else {
-                    cuhll::sketch_sequences_streaming(
-                        s, std::vector<std::string>{r.input_path}, k,
-                        static_cast<std::size_t>(chunk_mb));
-                }
+                cuhll::sketch_sequences_streaming(
+                    s, std::vector<std::string>{path}, k,
+                    static_cast<std::size_t>(chunk_mb));
                 const std::uint64_t est = s.estimate();
-                std::cout << r.display << '\t' << est << '\n';
+                std::cout << path << '\t' << est << '\n';
                 if (write_per_genome_files) {
-                    const std::string stem = std::filesystem::path(r.display).stem().string();
+                    const std::string stem = std::filesystem::path(path).stem().string();
                     const std::string out_path = output_dir + "/" + stem + ".hll";
                     if (verbose && std::filesystem::exists(out_path)) {
                         std::fprintf(stderr, "[cuHLL] overwriting existing %s\n",
@@ -368,14 +430,14 @@ int main(int argc, char** argv) {
                     k, precision, chunk_mb, fasta_paths.size(),
                     stream_ms, estimate_ms, ms_since(t_total));
             }
-        } else if (routed.size() == 1 && routed[0].backend == 0) {
+        } else if (inputs.size() == 1) {
             // I2 fast path: single FASTA input, union mode. Kick off the
             // FASTA parse in a worker thread so it runs concurrently with
             // the Sketch ctor's CUDA lazy init (~80 ms on a fresh process).
             // By the time the parse future resolves, the Sketch is ready
             // and we can go straight to the single-stream kernel without
             // paying for the 3-slot streaming pipeline's pinned alloc.
-            const std::string& path = routed[0].input_path;
+            const std::string& path = inputs[0];
             auto parse_fut = std::async(std::launch::async, [&]() {
                 return cuhll::read_fasta_concat(path);
             });
@@ -403,22 +465,11 @@ int main(int argc, char** argv) {
             std::cout << est << std::endl;
             return 0;
         } else {
-            // Union mode: split routed inputs by backend, feed each pipeline once.
-            std::vector<std::string> fa_bucket, cb_bucket;
-            for (const auto& r : routed) {
-                if (r.backend == 1) cb_bucket.push_back(r.input_path);
-                else                fa_bucket.push_back(r.input_path);
-            }
+            // Union mode, multiple FASTAs: one sketch, one streaming pass.
             cuhll::Sketch sketch(precision, canonical);
             auto t0 = clk::now();
-            if (!fa_bucket.empty()) {
-                cuhll::sketch_sequences_streaming(sketch, fa_bucket, k,
-                                                  static_cast<std::size_t>(chunk_mb));
-            }
-            if (!cb_bucket.empty()) {
-                cuhll::sketch_sequences_cb2_streaming(sketch, cb_bucket, k,
-                                                      static_cast<std::size_t>(chunk_mb));
-            }
+            cuhll::sketch_sequences_streaming(sketch, inputs, k,
+                                              static_cast<std::size_t>(chunk_mb));
             stream_ms = ms_since(t0);
 
             auto t2 = clk::now();
