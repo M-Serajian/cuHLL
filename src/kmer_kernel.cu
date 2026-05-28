@@ -60,52 +60,63 @@ kmer_extract_kernel(const char* __restrict__ seq,
         // k-mer starts at `owned_end - 1` and needs bases up to that + k - 1.
         const std::int64_t read_end = min(owned_end + static_cast<std::int64_t>(k) - 1, len);
 
-        unsigned valid = 0;
-        std::uint64_t fwd = 0;
-        std::uint64_t rc  = 0;
+        // Phase 1: scan for valid runs (contiguous ACGT stretches >= k).
+        // Absorbs all N-handling so Phases 2 and 3 are branch-free.
+        // With stripe=32 and k=31, at most ~2 valid runs per stripe.
+        struct Run { std::int64_t s, e; };
+        constexpr int kMaxRuns = 2;
+        Run runs[kMaxRuns];
+        int n_runs = 0;
+        std::int64_t rs = -1;
 
         for (std::int64_t i = stripe_start; i < read_end; ++i) {
-            const unsigned code = nt_base_code(seq[i]);
-            if (code > 3u) {
-                valid = 0;
-                continue;
-            }
-            ++valid;
-            if (valid < static_cast<unsigned>(k)) continue;
-
-            if (valid == static_cast<unsigned>(k)) {
-                // First full k-mer in this valid run: prime.
-                fwd = nt_hash_init_fwd(seq + i - k + 1, k);
-                rc  = nt_hash_init_rc (seq + i - k + 1, k);
+            if (nt_base_code(seq[i]) <= 3u) {
+                if (rs < 0) rs = i;
             } else {
-                // Roll by one base.
-                const unsigned code_out = nt_base_code(seq[i - k]);
-                fwd = nt_hash_roll_fwd(fwd, code_out, code, k);
-                rc  = nt_hash_roll_rc (rc,  code_out, code, k);
+                if (rs >= 0 && (i - rs) >= k && n_runs < kMaxRuns)
+                    runs[n_runs++] = {rs, i};
+                rs = -1;
             }
+        }
+        if (rs >= 0 && (read_end - rs) >= k && n_runs < kMaxRuns)
+            runs[n_runs++] = {rs, read_end};
 
-            // Ownership gate: only insert if the starting position of this
-            // k-mer lies in our owned stripe. This makes the right-overlap
-            // safe (we read into the next stripe's bases to finish our own
-            // last few k-mers, but don't re-insert k-mers that belong to it).
-            const std::int64_t kstart = i - static_cast<std::int64_t>(k) + 1;
-            if (kstart >= stripe_start && kstart < owned_end) {
-                // L1: canonical = min(fwd, rc); non-canonical = fwd.
-                // Runtime branch is warp-uniform (the same bool for all
-                // threads in a launch), so there is no divergence cost.
+        // Phase 2 + 3: for each valid run, init once then roll.
+        for (int r = 0; r < n_runs; ++r) {
+            // Phase 2: prime fwd and rc hashes over the first k bases.
+            std::uint64_t fwd = nt_hash_init_fwd(seq + runs[r].s, k);
+            std::uint64_t rc  = nt_hash_init_rc (seq + runs[r].s, k);
+
+            std::int64_t kstart = runs[r].s;
+            if (kstart >= stripe_start && kstart < owned_end)
                 ref.add(canonical ? nt_canonical(fwd, rc) : fwd);
+
+            // Phase 3: pure rolling — no N-checks, no valid tracking.
+            for (std::int64_t i = runs[r].s + k; i < runs[r].e; ++i) {
+                const unsigned code_out = nt_base_code(seq[i - k]);
+                const unsigned code_in  = nt_base_code(seq[i]);
+                fwd = nt_hash_roll_fwd(fwd, code_out, code_in, k);
+                rc  = nt_hash_roll_rc (rc,  code_out, code_in, k);
+
+                kstart = i - static_cast<std::int64_t>(k) + 1;
+                if (kstart >= stripe_start && kstart < owned_end)
+                    ref.add(canonical ? nt_canonical(fwd, rc) : fwd);
             }
         }
     }
 }
 
 namespace {
-// Process-local cached grid params. First launch runs the occupancy query;
-// subsequent launches reuse the decision.
+// Process-local cache. blocks_per_sm + sm_count come from a one-shot
+// occupancy query at first launch; the actual grid size is computed
+// per-launch from the input length (see launch_kmer_extract).
 struct LaunchCache {
-    bool   ready        = false;
-    int    blocks_per_sm = 0;
-    int    grid          = 0;
+    bool ready          = false;
+    int  blocks_per_sm  = 0;
+    int  sm_count       = 0;
+    int  occupancy_grid = 0;   // sm_count × blocks_per_sm — used as the
+                                // floor on small inputs so we don't
+                                // under-fill the GPU.
 };
 
 LaunchCache& launch_cache() {
@@ -113,7 +124,7 @@ LaunchCache& launch_cache() {
     return c;
 }
 
-void resolve_grid_once() {
+void resolve_occupancy_once() {
     auto& c = launch_cache();
     if (c.ready) return;
 
@@ -126,17 +137,18 @@ void resolve_grid_once() {
         kmer_extract_kernel,
         kKmerExtractBlockSize,
         /*dynamicSMemBytes=*/0));
-    c.blocks_per_sm = blocks_per_sm;
-    c.grid          = prop.multiProcessorCount * blocks_per_sm;
-    c.ready         = true;
+    c.blocks_per_sm  = blocks_per_sm;
+    c.sm_count       = prop.multiProcessorCount;
+    c.occupancy_grid = prop.multiProcessorCount * blocks_per_sm;
+    c.ready          = true;
 
-    // One-shot log line on first launch so the milestone (c) run captures the
-    // numbers we promised to record.
     std::fprintf(stderr,
-                 "[cuHLL] kmer_extract_kernel occupancy: blockSize=%d blocks_per_sm=%d "
-                 "multiProcessorCount=%d grid=%d stripe=%d\n",
-                 kKmerExtractBlockSize, blocks_per_sm, prop.multiProcessorCount,
-                 c.grid, kKmerExtractStripe);
+                 "[cuHLL] kmer_extract_kernel occupancy: blockSize=%d "
+                 "blocks_per_sm=%d multiProcessorCount=%d "
+                 "occupancy_grid=%d stripe=%d\n",
+                 kKmerExtractBlockSize, blocks_per_sm,
+                 prop.multiProcessorCount, c.occupancy_grid,
+                 kKmerExtractStripe);
 }
 
 } // namespace
@@ -149,14 +161,34 @@ void launch_kmer_extract(const char* d_seq,
                          bool canonical,
                          int* blocks_per_sm_out) {
     CUHLL_NVTX_RANGE("launch_kmer_extract");
-    resolve_grid_once();
+    resolve_occupancy_once();
     const auto& c = launch_cache();
 
     if (blocks_per_sm_out) *blocks_per_sm_out = c.blocks_per_sm;
 
-    if (len < static_cast<std::int64_t>(k)) return; // no k-mers; skip launch
+    if (len < static_cast<std::int64_t>(k)) return;
 
-    kmer_extract_kernel<<<c.grid, kKmerExtractBlockSize, 0, stream>>>(
+    // Grid sized to the input so each thread does at most one
+    // grid-stride iteration. Stripe size is preserved (still 1024
+    // positions per thread) so the rolling-hash savings within a
+    // stripe stay intact — we only change how many blocks compete
+    // for SMs.
+    //
+    // Floor at the SM-occupancy grid so small inputs still saturate
+    // the device. Cap at int max for safety; CUDA's grid limit is
+    // 2^31-1 per dim and we never come anywhere near that in practice.
+    const std::int64_t n_positions = len - static_cast<std::int64_t>(k) + 1;
+    const std::int64_t positions_per_block =
+        static_cast<std::int64_t>(kKmerExtractBlockSize) *
+        static_cast<std::int64_t>(kKmerExtractStripe);
+    std::int64_t grid64 =
+        (n_positions + positions_per_block - 1) / positions_per_block;
+    if (grid64 < c.occupancy_grid) grid64 = c.occupancy_grid;
+    constexpr std::int64_t kGridCap = (1LL << 30);
+    if (grid64 > kGridCap) grid64 = kGridCap;
+    const int grid = static_cast<int>(grid64);
+
+    kmer_extract_kernel<<<grid, kKmerExtractBlockSize, 0, stream>>>(
         d_seq, len, k, kKmerExtractStripe, ref, canonical);
     CUDA_CHECK_LAST();
 }

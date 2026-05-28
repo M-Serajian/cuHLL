@@ -29,9 +29,9 @@ namespace cuhll {
 //   - larger stripes amortize per-mer roll cost but leave tail threads
 //     imbalanced on short sequences;
 //   - smaller stripes expose more parallelism but raise per-byte overhead.
-// 1024 is the project-wide default per the locked design.
+// 32 keeps each block's working set (~16 KB) inside L1 cache.
 constexpr int kKmerExtractBlockSize = 256;
-constexpr int kKmerExtractStripe    = 1024;
+constexpr int kKmerExtractStripe    = 32;
 
 // Single-uint64 hash-state invariant. Widening to k > 32 requires a 128-bit
 // carrier — see the FUTURE comment inside the kernel.

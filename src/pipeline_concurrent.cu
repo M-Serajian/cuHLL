@@ -85,7 +85,51 @@ private:
 struct ParsedGenome {
     std::size_t       idx;
     std::string       display_path;
-    std::string       bases;
+    std::string       bases;          // fallback when no pinned buffer
+    char*             pinned_buf;     // non-null: parsed directly into pinned mem
+    std::size_t       pinned_len;     // bytes written into pinned_buf
+};
+
+// Simple thread-safe pool of pinned buffers for reader threads.
+class PinnedPool {
+public:
+    PinnedPool(int count, std::size_t buf_size) : buf_size_(buf_size) {
+        for (int i = 0; i < count; ++i) {
+            void* p = nullptr;
+            auto err = cudaHostAlloc(&p, buf_size, cudaHostAllocDefault);
+            if (err == cudaSuccess) bufs_.push_back(static_cast<char*>(p));
+        }
+    }
+    ~PinnedPool() {
+        for (auto* p : bufs_) cudaFreeHost(p);
+        for (auto* p : out_) cudaFreeHost(p);
+    }
+
+    char* checkout() {
+        std::lock_guard<std::mutex> g(mu_);
+        if (bufs_.empty()) return nullptr;
+        char* p = bufs_.back();
+        bufs_.pop_back();
+        out_.push_back(p);
+        return p;
+    }
+
+    void checkin(char* p) {
+        std::lock_guard<std::mutex> g(mu_);
+        auto it = std::find(out_.begin(), out_.end(), p);
+        if (it != out_.end()) {
+            out_.erase(it);
+            bufs_.push_back(p);
+        }
+    }
+
+    std::size_t buf_size() const { return buf_size_; }
+
+private:
+    std::mutex mu_;
+    std::vector<char*> bufs_;
+    std::vector<char*> out_;
+    std::size_t buf_size_;
 };
 
 struct WriteJob {
@@ -113,6 +157,7 @@ struct StreamSlot {
     std::size_t       in_flight_idx = 0;
     std::string       in_flight_display;
     std::size_t       in_flight_bases = 0;
+    char*             in_flight_pinned = nullptr; // borrowed from PinnedPool
 };
 
 // -------------------------------------------------------------------------
@@ -209,7 +254,10 @@ std::uint64_t sketch_per_genome_auto(
     // Union register accumulator (CPU side).
     std::vector<std::uint32_t> union_regs(n_regs, 0);
 
-    // 4. Spawn readers.
+    // 4. Pinned-buffer pool for readers (eliminates memcpy in launch_slot).
+    PinnedPool pinned_pool(at.n_readers + 2, d_buf_bytes);
+
+    // 5. Spawn readers.
     std::vector<std::thread> readers;
     readers.reserve(at.n_readers);
     std::atomic<bool> reader_fault{false};
@@ -221,14 +269,23 @@ std::uint64_t sketch_per_genome_auto(
                 auto item = input_q.pop();
                 if (!item) break;
                 try {
-                    CUHLL_NVTX_RANGE("read_fasta_concat");
-                    std::string bases = read_fasta_concat(item->path);
-                    ready_q.push({item->idx, item->path, std::move(bases)});
+                    CUHLL_NVTX_RANGE("read_fasta");
+                    char* pbuf = pinned_pool.checkout();
+                    if (pbuf) {
+                        std::size_t n = read_fasta_into(
+                            item->path, pbuf, pinned_pool.buf_size());
+                        ready_q.push({item->idx, item->path, std::string{},
+                                      pbuf, n});
+                    } else {
+                        std::string bases = read_fasta_concat(item->path);
+                        ready_q.push({item->idx, item->path,
+                                      std::move(bases), nullptr, 0});
+                    }
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> g(reader_error_mu);
                     if (!reader_fault.exchange(true)) reader_error = e.what();
-                    // Push an empty record so dispatcher's count stays correct.
-                    ready_q.push({item->idx, item->path, std::string{}});
+                    ready_q.push({item->idx, item->path, std::string{},
+                                  nullptr, 0});
                 }
             }
         });
@@ -288,6 +345,10 @@ std::uint64_t sketch_per_genome_auto(
 
         write_q.push(std::move(job));
 
+        if (sl.in_flight_pinned) {
+            pinned_pool.checkin(sl.in_flight_pinned);
+            sl.in_flight_pinned = nullptr;
+        }
         sl.busy = false;
         ++n_completed;
         return true;
@@ -296,15 +357,21 @@ std::uint64_t sketch_per_genome_auto(
     auto launch_slot = [&](int i, ParsedGenome& pg) {
         CUHLL_NVTX_RANGE("launch_slot_per_genome");
         auto& sl = slots[i];
-        const std::size_t n = pg.bases.size();
+        const bool use_pinned = (pg.pinned_buf != nullptr);
+        const std::size_t n = use_pinned ? pg.pinned_len : pg.bases.size();
         if (n > sl.d_bytes) {
+            if (use_pinned) pinned_pool.checkin(pg.pinned_buf);
             throw std::runtime_error(
                 "cuHLL concurrent: parsed genome exceeds per-stream buffer");
         }
-        // H2D via pinned staging.
-        if (n > 0) std::memcpy(sl.h_input, pg.bases.data(), n);
-        CUDA_CHECK(cudaMemcpyAsync(sl.d_input, sl.h_input, n,
-                                   cudaMemcpyHostToDevice, sl.stream));
+        if (use_pinned) {
+            CUDA_CHECK(cudaMemcpyAsync(sl.d_input, pg.pinned_buf, n,
+                                       cudaMemcpyHostToDevice, sl.stream));
+        } else {
+            if (n > 0) std::memcpy(sl.h_input, pg.bases.data(), n);
+            CUDA_CHECK(cudaMemcpyAsync(sl.d_input, sl.h_input, n,
+                                       cudaMemcpyHostToDevice, sl.stream));
+        }
         auto ref = sl.sketch->impl_ref().sketch.ref();
         if (n >= static_cast<std::size_t>(k)) {
             launch_kmer_extract(static_cast<const char*>(sl.d_input),
@@ -312,7 +379,6 @@ std::uint64_t sketch_per_genome_auto(
                                  k, ref, sl.stream,
                                  sl.sketch->canonical());
         }
-        // D2H registers for the .hll write.
         const void* d_regs = sl.sketch->impl_ref().sketch.sketch().data();
         CUDA_CHECK(cudaMemcpyAsync(sl.h_regs, d_regs, reg_bytes,
                                    cudaMemcpyDeviceToHost, sl.stream));
@@ -322,6 +388,7 @@ std::uint64_t sketch_per_genome_auto(
         sl.in_flight_idx     = pg.idx;
         sl.in_flight_display = std::move(pg.display_path);
         sl.in_flight_bases   = n;
+        sl.in_flight_pinned  = use_pinned ? pg.pinned_buf : nullptr;
         ++n_launched;
     };
 
@@ -451,6 +518,8 @@ std::uint64_t union_estimate_auto(
     }
     input_q.close();
 
+    PinnedPool union_pinned_pool(at.n_readers + 2, d_buf_bytes);
+
     std::vector<std::thread> readers;
     readers.reserve(at.n_readers);
     std::atomic<bool> reader_fault{false};
@@ -462,18 +531,30 @@ std::uint64_t union_estimate_auto(
                 auto item = input_q.pop();
                 if (!item) break;
                 try {
-                    CUHLL_NVTX_RANGE("read_fasta_concat");
-                    std::string bases = read_fasta_concat(item->path);
-                    ready_q.push({item->idx, item->path, std::move(bases)});
+                    CUHLL_NVTX_RANGE("read_fasta");
+                    char* pbuf = union_pinned_pool.checkout();
+                    if (pbuf) {
+                        std::size_t n = read_fasta_into(
+                            item->path, pbuf, union_pinned_pool.buf_size());
+                        ready_q.push({item->idx, item->path, std::string{},
+                                      pbuf, n});
+                    } else {
+                        std::string bases = read_fasta_concat(item->path);
+                        ready_q.push({item->idx, item->path,
+                                      std::move(bases), nullptr, 0});
+                    }
                 } catch (const std::exception& e) {
                     std::lock_guard<std::mutex> g(reader_error_mu);
                     if (!reader_fault.exchange(true)) reader_error = e.what();
-                    // Push an empty record so the dispatcher's count stays correct.
-                    ready_q.push({item->idx, item->path, std::string{}});
+                    ready_q.push({item->idx, item->path, std::string{},
+                                  nullptr, 0});
                 }
             }
         });
     }
+
+    // Track which pinned buffer each slot borrowed, for return on drain.
+    std::vector<char*> slot_pinned(n_streams, nullptr);
 
     std::size_t n_launched  = 0;
     std::size_t n_completed = 0;
@@ -483,6 +564,10 @@ std::uint64_t union_estimate_auto(
         auto& sl = slots[i];
         if (!sl.busy) return false;
         if (cudaEventQuery(sl.done) != cudaSuccess) return false;
+        if (slot_pinned[i]) {
+            union_pinned_pool.checkin(slot_pinned[i]);
+            slot_pinned[i] = nullptr;
+        }
         sl.busy = false;
         ++n_completed;
         return true;
@@ -491,14 +576,21 @@ std::uint64_t union_estimate_auto(
     auto launch_slot = [&](int i, ParsedGenome& pg) {
         CUHLL_NVTX_RANGE("launch_slot_union");
         auto& sl = slots[i];
-        const std::size_t n = pg.bases.size();
+        const bool use_pinned = (pg.pinned_buf != nullptr);
+        const std::size_t n = use_pinned ? pg.pinned_len : pg.bases.size();
         if (n > d_buf_bytes) {
+            if (use_pinned) union_pinned_pool.checkin(pg.pinned_buf);
             throw std::runtime_error(
                 "cuHLL union: parsed genome exceeds per-stream buffer");
         }
-        if (n > 0) std::memcpy(sl.h_in, pg.bases.data(), n);
-        CUDA_CHECK(cudaMemcpyAsync(sl.d_in, sl.h_in, n,
-                                   cudaMemcpyHostToDevice, sl.stream));
+        if (use_pinned) {
+            CUDA_CHECK(cudaMemcpyAsync(sl.d_in, pg.pinned_buf, n,
+                                       cudaMemcpyHostToDevice, sl.stream));
+        } else {
+            if (n > 0) std::memcpy(sl.h_in, pg.bases.data(), n);
+            CUDA_CHECK(cudaMemcpyAsync(sl.d_in, sl.h_in, n,
+                                       cudaMemcpyHostToDevice, sl.stream));
+        }
         if (n >= static_cast<std::size_t>(k)) {
             launch_kmer_extract(static_cast<const char*>(sl.d_in),
                                 static_cast<std::int64_t>(n),
@@ -506,6 +598,7 @@ std::uint64_t union_estimate_auto(
         }
         CUDA_CHECK(cudaEventRecord(sl.done, sl.stream));
         sl.busy = true;
+        slot_pinned[i] = use_pinned ? pg.pinned_buf : nullptr;
         ++n_launched;
     };
 

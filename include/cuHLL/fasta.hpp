@@ -23,6 +23,12 @@ namespace cuhll {
 
 std::string read_fasta_concat(const std::string& path);
 
+// Parse directly into caller-provided buffer (e.g. pinned memory).
+// Returns number of bytes written. Same format/correctness guarantees
+// as read_fasta_concat.
+std::size_t read_fasta_into(const std::string& path, char* dst,
+                            std::size_t capacity);
+
 class FastaChunkReader {
 public:
     explicit FastaChunkReader(const std::string& path);

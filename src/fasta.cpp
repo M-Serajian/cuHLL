@@ -2,29 +2,63 @@
 #include "cuHLL/nvtx_util.hpp"
 
 #include <algorithm>
+#include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <ios>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <sys/stat.h>
 #include <zlib.h>
 
 namespace cuhll {
 
 namespace {
 
-// zlib's gzopen transparently handles both gzipped and plain files (it
-// sniffs the gzip magic and falls through to a passthrough reader when
-// absent). One code path, two formats.
-std::vector<char> slurp_all_bytes(const std::string& path) {
+constexpr int kGzipInflation = 4;
+
+bool is_gzip(const std::string& path) {
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) return false;
+    unsigned char magic[2] = {0, 0};
+    std::size_t got = std::fread(magic, 1, 2, f);
+    std::fclose(f);
+    return (got == 2 && magic[0] == 0x1f && magic[1] == 0x8b);
+}
+
+std::vector<char> slurp_plain(const std::string& path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0) {
+        throw std::runtime_error("cuHLL: stat failed: " + path);
+    }
+    const std::size_t sz = static_cast<std::size_t>(st.st_size);
+    std::vector<char> out(sz);
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        throw std::runtime_error("cuHLL: cannot open: " + path);
+    }
+    std::size_t got = std::fread(out.data(), 1, sz, f);
+    std::fclose(f);
+    out.resize(got);
+    return out;
+}
+
+std::vector<char> slurp_gzip(const std::string& path) {
     gzFile zf = gzopen(path.c_str(), "rb");
     if (!zf) {
         throw std::runtime_error("cuHLL: cannot open: " + path);
     }
-    constexpr int CHUNK = 64 * 1024;
+    struct stat st{};
+    std::size_t hint = 256 * 1024;
+    if (::stat(path.c_str(), &st) == 0) {
+        hint = static_cast<std::size_t>(st.st_size) * kGzipInflation;
+    }
+    constexpr int CHUNK = 256 * 1024;
     std::vector<char> out;
-    out.reserve(CHUNK);
+    out.reserve(hint);
     char buf[CHUNK];
     int n;
     while ((n = gzread(zf, buf, static_cast<unsigned>(CHUNK))) > 0) {
@@ -41,10 +75,14 @@ std::vector<char> slurp_all_bytes(const std::string& path) {
     return out;
 }
 
-// Parse FASTA bytes into the bases-with-'N'-between-records representation.
-// memchr-based bulk scan — the inner loop only runs char-by-char in the
-// rare case a sequence line contains whitespace or a mid-line '>'. On a
-// 56 MB chr19 record this is ~near-memcpy-bandwidth on an L4 host.
+std::vector<char> slurp_all_bytes(const std::string& path) {
+    return is_gzip(path) ? slurp_gzip(path) : slurp_plain(path);
+}
+
+// Parse FASTA bytes: one memchr per line (find '\n'), one byte check for
+// '>' at line start, strip '\r' before '\n'. Non-ACGT characters that slip
+// through (spaces, tabs) are harmless — the kernel's nt_base_code returns
+// code=4, resetting the kmer window, same as an 'N'.
 std::string parse_fasta_bytes(const char* base, std::size_t len) {
     std::string out;
     out.reserve(len);
@@ -53,35 +91,22 @@ std::string parse_fasta_bytes(const char* base, std::size_t len) {
     bool first_record_seen = false;
 
     while (p < end) {
+        if (*p == '\n' || *p == '\r') { ++p; continue; }
         if (*p == '>') {
             if (first_record_seen) out.push_back('N');
             first_record_seen = true;
             const char* nl = static_cast<const char*>(
                 std::memchr(p, '\n', static_cast<std::size_t>(end - p)));
-            if (!nl) break;
-            p = nl + 1;
+            p = nl ? nl + 1 : end;
             continue;
         }
-        if (*p == '\n' || *p == '\r') { ++p; continue; }
-
         const char* nl = static_cast<const char*>(
             std::memchr(p, '\n', static_cast<std::size_t>(end - p)));
-        const char* region_end = nl ? nl : end;
-
-        if (std::memchr(p, ' ',  static_cast<std::size_t>(region_end - p)) == nullptr &&
-            std::memchr(p, '\t', static_cast<std::size_t>(region_end - p)) == nullptr &&
-            std::memchr(p, '\r', static_cast<std::size_t>(region_end - p)) == nullptr &&
-            std::memchr(p, '>',  static_cast<std::size_t>(region_end - p)) == nullptr) {
-            out.append(p, static_cast<std::size_t>(region_end - p));
-        } else {
-            for (const char* q = p; q < region_end; ++q) {
-                const char c = *q;
-                if (c == ' ' || c == '\t' || c == '\r' || c == '\n') continue;
-                if (c == '>') { region_end = q; break; }
-                out.push_back(c);
-            }
-        }
-        p = region_end;
+        const char* le = nl ? nl : end;
+        std::size_t n = static_cast<std::size_t>(le - p);
+        if (n > 0 && p[n - 1] == '\r') --n;
+        out.append(p, n);
+        p = nl ? nl + 1 : end;
     }
     return out;
 }
@@ -136,7 +161,83 @@ std::string parse_sequences(const char* base, std::size_t len) {
         "be '>' (FASTA) or '@' (FASTQ)");
 }
 
-}  // namespace
+// Variants that write into a caller-provided char* buffer instead of
+// returning std::string. Used by the concurrent pipeline to parse directly
+// into pinned memory (eliminates one full memcpy per genome).
+
+std::size_t parse_fasta_into(const char* base, std::size_t len,
+                             char* dst, std::size_t cap) {
+    const char* const end = base + len;
+    const char* p = base;
+    bool first_record_seen = false;
+    std::size_t pos = 0;
+
+    while (p < end && pos < cap) {
+        if (*p == '\n' || *p == '\r') { ++p; continue; }
+        if (*p == '>') {
+            if (first_record_seen && pos < cap) dst[pos++] = 'N';
+            first_record_seen = true;
+            const char* nl = static_cast<const char*>(
+                std::memchr(p, '\n', static_cast<std::size_t>(end - p)));
+            p = nl ? nl + 1 : end;
+            continue;
+        }
+        const char* nl = static_cast<const char*>(
+            std::memchr(p, '\n', static_cast<std::size_t>(end - p)));
+        const char* le = nl ? nl : end;
+        std::size_t n = static_cast<std::size_t>(le - p);
+        if (n > 0 && p[n - 1] == '\r') --n;
+        if (pos + n > cap) n = cap - pos;
+        std::memcpy(dst + pos, p, n);
+        pos += n;
+        p = nl ? nl + 1 : end;
+    }
+    return pos;
+}
+
+std::size_t parse_fastq_into(const char* base, std::size_t len,
+                             char* dst, std::size_t cap) {
+    const char* const end = base + len;
+    const char* p = base;
+    int line_in_record = 0;
+    bool first_seq = true;
+    std::size_t pos = 0;
+
+    while (p < end) {
+        const char* nl = static_cast<const char*>(
+            std::memchr(p, '\n', static_cast<std::size_t>(end - p)));
+        const char* line_end = nl ? nl : end;
+
+        if (line_in_record == 1) {
+            if (!first_seq && pos < cap) dst[pos++] = 'N';
+            first_seq = false;
+            for (const char* q = p; q < line_end && pos < cap; ++q) {
+                const char c = *q;
+                if (c == '\r' || c == ' ' || c == '\t') continue;
+                dst[pos++] = c;
+            }
+        }
+        line_in_record = (line_in_record + 1) % 4;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return pos;
+}
+
+std::size_t parse_sequences_into(const char* base, std::size_t len,
+                                 char* dst, std::size_t cap) {
+    const char* p = base;
+    const char* const end = base + len;
+    while (p < end && (*p == '\n' || *p == '\r' || *p == ' ' || *p == '\t'))
+        ++p;
+    if (p == end) return 0;
+    const std::size_t rem = static_cast<std::size_t>(end - p);
+    if (*p == '>') return parse_fasta_into(p, rem, dst, cap);
+    if (*p == '@') return parse_fastq_into(p, rem, dst, cap);
+    return 0;
+}
+
+}  // anonymous namespace
 
 // -----------------------------------------------------------------------------
 // read_fasta_concat — name kept for backward compatibility. Transparently
@@ -149,6 +250,14 @@ std::string read_fasta_concat(const std::string& path) {
     auto bytes = slurp_all_bytes(path);
     if (bytes.empty()) return {};
     return parse_sequences(bytes.data(), bytes.size());
+}
+
+std::size_t read_fasta_into(const std::string& path, char* dst,
+                            std::size_t capacity) {
+    CUHLL_NVTX_RANGE("read_fasta_into");
+    auto bytes = slurp_all_bytes(path);
+    if (bytes.empty()) return 0;
+    return parse_sequences_into(bytes.data(), bytes.size(), dst, capacity);
 }
 
 // -----------------------------------------------------------------------------
