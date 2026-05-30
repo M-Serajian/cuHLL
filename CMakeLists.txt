@@ -614,6 +614,12 @@ set_target_properties(cuhll_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON
 )
+# --generate-line-info embeds source-line info in the binary so NCU's Source
+# view can map SASS instructions back to .cu / .cuh lines. Zero runtime cost
+# (debug metadata only) — kept on by default for ongoing profiling work.
+target_compile_options(cuhll_core PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>
+)
 
 # -----------------------------------------------------------------------------
 # cuhll executable. main.cpp is plain C++; the CUDA TUs live in cuhll_core.

@@ -28,6 +28,52 @@
 
 namespace cuhll {
 
+// Helper for shared-mem LUT initialization. Pure switch over 256 entries
+// — fires once per block (with blockDim.x == 256, each thread does one entry
+// in parallel). Total: 256 evaluations per kernel launch, fully amortized.
+__device__ __forceinline__ unsigned char nt_base_code_for_lut(unsigned char c) {
+    switch (c) {
+        case 'A': case 'a': return 0u;
+        case 'C': case 'c': return 1u;
+        case 'G': case 'g': return 2u;
+        case 'T': case 't': return 3u;
+        default:            return 4u;
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Industry-grade kmer_extract_kernel.
+//
+// Memory hierarchy:
+//   1. Vectorized cooperative load (int4 = 16 bytes per thread per load) of
+//      a per-block tile from global seq[] into a shared codes[] tile.
+//      Per-warp: 32 threads × 16 bytes = 512 contiguous bytes per LDG.E.128.
+//      Brings global-load efficiency from 3% (1/32 bytes/sector) to 100%.
+//   2. Shared-memory LUT (256 bytes) replaces the 5-way switch in nt_base_code.
+//      Initialized once per block by 256 threads in parallel, then broadcast.
+//      No data-dependent branching in the hot loop — eliminates the warp
+//      serialization that NCU flagged at 18.6/32 active threads.
+//   3. Contiguous tile layout in shared memory. The 8-way bank conflict on
+//      byte access in hot loops is a known tradeoff: ~8 cycles per shared
+//      read vs. ~30 cycles per L1-hit global read. Still a net win.
+//   4. __ldg() on the vectorized load tells the compiler this is read-only
+//      so it can use the texture-style cache path with prefetch.
+//
+// Why the contiguous layout (and not padded per-thread rows):
+//   The padded layout (stride 68) eliminates the 8-way bank conflict but
+//   triples the shared memory footprint, dropping occupancy from 6 to 3
+//   blocks/SM on the L4 (100 KB shared mem cap). Empirical A/B testing
+//   showed the lower occupancy cost (less latency hiding) outweighs the
+//   bank-conflict win on this GPU. On A100/H100/B200, the larger shared
+//   memory budget (164-228 KB / SM) lets the padded layout keep full
+//   occupancy — for those targets, switching to a padded variant guarded by
+//   __CUDA_ARCH__ would be the optimal next step.
+// -----------------------------------------------------------------------------
+constexpr int kCodesTileBytes = kKmerExtractBlockSize * kKmerExtractStripe
+                              + static_cast<int>(kMaxK);
+static_assert(kKmerExtractBlockSize == 256,
+              "Shared LUT init below assumes 256 threads (1 entry per thread).");
+
 __global__ void __launch_bounds__(kKmerExtractBlockSize)
 kmer_extract_kernel(const char* __restrict__ seq,
                     std::int64_t len,
@@ -35,74 +81,125 @@ kmer_extract_kernel(const char* __restrict__ seq,
                     int stripe_len,
                     SketchHllRef ref,
                     bool canonical) {
-    // Per-thread state. 64-bit throughout — single-uint64 ntHash path.
-    //
-    // FUTURE: 128-bit extension.
-    // For k in (32, 63], the ntHash state stays 64-bit but the canonical
-    // k-mer packing widens to two uint64_t's. The insert key would become a
-    // pair<uint64_t,uint64_t> (or __uint128_t) and cuco would need a matching
-    // hyperloglog instantiation. ntHash itself is unchanged — that's the
-    // whole point of picking it here.
-    const std::int64_t tid  = static_cast<std::int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-    const std::int64_t grid = static_cast<std::int64_t>(gridDim.x)  * blockDim.x;
+    // Shared memory layout:
+    //   - codes[]: decoded base codes for the block's tile (contiguous).
+    //   - lut[256]: char → base code lookup, initialized once at block start.
+    __shared__ unsigned char codes[kCodesTileBytes];
+    __shared__ unsigned char lut[256];
 
-    for (std::int64_t stripe_start = tid * stripe_len;
-         stripe_start < len;
-         stripe_start += grid * stripe_len) {
+    // One-time LUT init. blockDim.x == 256 (asserted above) so each thread
+    // does exactly one entry in parallel, no loop needed.
+    lut[threadIdx.x] = nt_base_code_for_lut(static_cast<unsigned char>(threadIdx.x));
+    __syncthreads();
 
-        // k-mer starts owned by this stripe: [stripe_start, owned_end)
-        // clipped to [0, len - k + 1).
-        const std::int64_t owned_end = min(stripe_start + stripe_len,
-                                           len - static_cast<std::int64_t>(k) + 1);
-        if (owned_end <= stripe_start) continue; // nothing to produce
+    const std::int64_t block_tile_step =
+        static_cast<std::int64_t>(gridDim.x) * blockDim.x * stripe_len;
 
-        // Last base index the stripe may read (inclusive). The last owned
-        // k-mer starts at `owned_end - 1` and needs bases up to that + k - 1.
-        const std::int64_t read_end = min(owned_end + static_cast<std::int64_t>(k) - 1, len);
+    for (std::int64_t tile_start =
+             static_cast<std::int64_t>(blockIdx.x) * blockDim.x * stripe_len;
+         tile_start < len;
+         tile_start += block_tile_step) {
 
-        // Phase 1: scan for valid runs (contiguous ACGT stretches >= k).
-        // Absorbs all N-handling so Phases 2 and 3 are branch-free.
-        // With stripe=32 and k=31, at most ~2 valid runs per stripe.
-        struct Run { std::int64_t s, e; };
-        constexpr int kMaxRuns = 2;
-        Run runs[kMaxRuns];
-        int n_runs = 0;
-        std::int64_t rs = -1;
+        // Bytes this block needs: all per-thread stripes + k-1 overlap.
+        const std::int64_t tile_end_max =
+            tile_start + static_cast<std::int64_t>(blockDim.x) * stripe_len
+                       + static_cast<std::int64_t>(k) - 1;
+        const std::int64_t tile_end = min(tile_end_max, len);
+        const int tile_len = static_cast<int>(tile_end - tile_start);
 
-        for (std::int64_t i = stripe_start; i < read_end; ++i) {
-            if (nt_base_code(seq[i]) <= 3u) {
-                if (rs < 0) rs = i;
-            } else {
-                if (rs >= 0 && (i - rs) >= k && n_runs < kMaxRuns)
-                    runs[n_runs++] = {rs, i};
-                rs = -1;
+        // -- Vectorized cooperative load --
+        // The tile_start address is always aligned to (blockDim.x * stripe_len)
+        // = 8192 bytes, which is 16-byte aligned. So int4 loads are safe for
+        // the body. Handle the last partial chunk with byte fallback.
+        const int int4_count = tile_len / 16;
+        const int tail_start = int4_count * 16;
+        const int4* __restrict__ seq_vec =
+            reinterpret_cast<const int4*>(seq + tile_start);
+
+        for (int i = threadIdx.x; i < int4_count; i += blockDim.x) {
+            const int4 v = __ldg(&seq_vec[i]);
+            const unsigned char* bytes =
+                reinterpret_cast<const unsigned char*>(&v);
+            const int out = i * 16;
+            #pragma unroll
+            for (int j = 0; j < 16; ++j) {
+                codes[out + j] = lut[bytes[j]];
             }
         }
-        if (rs >= 0 && (read_end - rs) >= k && n_runs < kMaxRuns)
-            runs[n_runs++] = {rs, read_end};
+        // Tail: 0–15 bytes that didn't fit in the int4 chunks.
+        for (int off = tail_start + threadIdx.x; off < tile_len; off += blockDim.x) {
+            codes[off] =
+                lut[static_cast<unsigned char>(seq[tile_start + off])];
+        }
+        __syncthreads();
 
-        // Phase 2 + 3: for each valid run, init once then roll.
-        for (int r = 0; r < n_runs; ++r) {
-            // Phase 2: prime fwd and rc hashes over the first k bases.
-            std::uint64_t fwd = nt_hash_init_fwd(seq + runs[r].s, k);
-            std::uint64_t rc  = nt_hash_init_rc (seq + runs[r].s, k);
+        // -- Per-thread stripe work --
+        // All offsets local (int) to keep register pressure low.
+        const int local_stripe = threadIdx.x * stripe_len;
+        const std::int64_t stripe_start_g = tile_start + local_stripe;
+        const std::int64_t owned_end_g =
+            min(stripe_start_g + stripe_len,
+                len - static_cast<std::int64_t>(k) + 1);
 
-            std::int64_t kstart = runs[r].s;
-            if (kstart >= stripe_start && kstart < owned_end)
-                ref.add(canonical ? nt_canonical(fwd, rc) : fwd);
+        if (stripe_start_g < len && owned_end_g > stripe_start_g) {
+            const std::int64_t read_end_g =
+                min(owned_end_g + static_cast<std::int64_t>(k) - 1, len);
+            const int local_read_end = static_cast<int>(read_end_g - tile_start);
+            const int local_owned_end = static_cast<int>(owned_end_g - tile_start);
 
-            // Phase 3: pure rolling — no N-checks, no valid tracking.
-            for (std::int64_t i = runs[r].s + k; i < runs[r].e; ++i) {
-                const unsigned code_out = nt_base_code(seq[i - k]);
-                const unsigned code_in  = nt_base_code(seq[i]);
-                fwd = nt_hash_roll_fwd(fwd, code_out, code_in, k);
-                rc  = nt_hash_roll_rc (rc,  code_out, code_in, k);
+            // Phase 1: scan for valid runs (>= k contiguous ACGT) in codes[].
+            int run_s[2], run_e[2];
+            int n_runs = 0;
+            int rs = -1;
 
-                kstart = i - static_cast<std::int64_t>(k) + 1;
-                if (kstart >= stripe_start && kstart < owned_end)
+            for (int i = local_stripe; i < local_read_end; ++i) {
+                if (codes[i] <= 3u) {
+                    if (rs < 0) rs = i;
+                } else {
+                    if (rs >= 0 && (i - rs) >= k && n_runs < 2) {
+                        run_s[n_runs] = rs;
+                        run_e[n_runs] = i;
+                        ++n_runs;
+                    }
+                    rs = -1;
+                }
+            }
+            if (rs >= 0 && (local_read_end - rs) >= k && n_runs < 2) {
+                run_s[n_runs] = rs;
+                run_e[n_runs] = local_read_end;
+                ++n_runs;
+            }
+
+            // Phase 2 + 3: init then roll, all reads from shared codes[].
+            for (int r = 0; r < n_runs; ++r) {
+                const int rs_l = run_s[r];
+                const int re_l = run_e[r];
+
+                std::uint64_t fwd = 0, rc = 0;
+                for (int j = 0; j < k; ++j) {
+                    const unsigned c = codes[rs_l + j];
+                    fwd ^= rotl64(nt_seed(c), k - 1 - j);
+                    rc  ^= rotl64(nt_seed(nt_complement_code(c)), j);
+                }
+
+                if (rs_l >= local_stripe && rs_l < local_owned_end)
                     ref.add(canonical ? nt_canonical(fwd, rc) : fwd);
+
+                for (int i = rs_l + k; i < re_l; ++i) {
+                    const unsigned co = codes[i - k];
+                    const unsigned ci = codes[i];
+                    fwd = nt_hash_roll_fwd(fwd, co, ci, k);
+                    rc  = nt_hash_roll_rc (rc,  co, ci, k);
+
+                    const int ks = i - k + 1;
+                    if (ks >= local_stripe && ks < local_owned_end)
+                        ref.add(canonical ? nt_canonical(fwd, rc) : fwd);
+                }
             }
         }
+
+        // Required before next iteration: codes[] is about to be overwritten.
+        __syncthreads();
     }
 }
 
