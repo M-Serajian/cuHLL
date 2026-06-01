@@ -22,9 +22,9 @@
 //      its argument.
 // =============================================================================
 
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 #include "test_common.hpp"
 
 #include <algorithm>

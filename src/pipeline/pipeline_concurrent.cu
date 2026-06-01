@@ -4,14 +4,14 @@
 // sketches are CLEARED between genomes and their registers D2H'd via a
 // pinned landing zone.
 
-#include "cuHLL/concurrent.hpp"
-#include "cuHLL/cuda_check.hpp"
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/hll_file.hpp"
-#include "cuHLL/kmer_kernel.cuh"
-#include "cuHLL/nvtx_util.hpp"
-#include "cuHLL/sketch.hpp"
-#include "cuHLL/sketch_internal.cuh"
+#include "cuHLL/pipeline/concurrent.hpp"
+#include "cuHLL/common/cuda_check.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/io/hll_file.hpp"
+#include "cuHLL/kmer/kmer_kernel.cuh"
+#include "cuHLL/common/nvtx_util.hpp"
+#include "cuHLL/sketch/sketch.hpp"
+#include "cuHLL/sketch/sketch_internal.cuh"
 
 #include <cuda_runtime.h>
 

@@ -1,12 +1,12 @@
 // pipeline.cu — orchestrator for single-stream and multi-stream pipelines.
 
-#include "cuHLL/cuda_check.hpp"
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/kmer_kernel.cuh"
-#include "cuHLL/nvtx_util.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
-#include "cuHLL/sketch_internal.cuh"
+#include "cuHLL/common/cuda_check.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/kmer/kmer_kernel.cuh"
+#include "cuHLL/common/nvtx_util.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
+#include "cuHLL/sketch/sketch_internal.cuh"
 
 #include <cuda_runtime.h>
 

@@ -1,4 +1,13 @@
 #pragma once
+// CUDA error-checking macros.
+//
+//   CUDA_CHECK(expr)    — evaluates `expr`, aborts with diagnostic on
+//                         non-success cudaError_t.
+//   CUDA_CHECK_LAST()   — checks cudaGetLastError(). Use after kernel
+//                         launches and other void-returning entry points.
+//
+// Both abort the process on failure; they are intended for unrecoverable
+// errors at the boundary between cuHLL and the CUDA runtime.
 
 #include <cuda_runtime.h>
 

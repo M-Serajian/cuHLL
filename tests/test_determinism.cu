@@ -9,8 +9,8 @@
 //      boundary-agnostic).
 // =============================================================================
 
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 #include "test_common.hpp"
 
 #include <cstdint>

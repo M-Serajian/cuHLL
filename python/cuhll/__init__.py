@@ -34,6 +34,24 @@ Quick examples
 >>> # One union estimate over a panel — concurrent path, no .hll kept
 >>> total = cuhll.estimate_union(["a.fasta", "b.fasta"], k=31)
 
+
+All-pairs Jaccard between saved sketches
+----------------------------------------
+
+For comparing many genomes pairwise, save the sketches with
+``sketch_to_dir`` and run the ``cuhll_pairwise`` CLI (installed
+alongside the Python wheel):
+
+.. code-block:: bash
+
+    cuhll_pairwise --sketches-dir sketches/ --threshold 0.5 > pairs.tsv
+
+Output is TSV with one line per pair: ``sketch_i_path TAB sketch_j_path
+TAB jaccard``. The full 16K-register Jaccard is computed for every pair;
+``--threshold`` only controls which ones are emitted (pairs below are
+dropped to keep the output manageable on large N).
+
+
 The on-disk `.hll` format is the stable interchange contract; see the
 README for the byte-level layout. All cardinality estimates carry HLL's
 inherent ~1.04/sqrt(2**precision) standard error.

@@ -19,12 +19,12 @@
 #include <string>
 #include <vector>
 
-#include "cuHLL/common.hpp"
-#include "cuHLL/concurrent.hpp"
-#include "cuHLL/hll_file.hpp"
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/common/common.hpp"
+#include "cuHLL/pipeline/concurrent.hpp"
+#include "cuHLL/io/hll_file.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 
 namespace py = pybind11;
 

@@ -15,10 +15,10 @@
 // internally (cooperative reduce across warps into the register array),
 // which is why passing the device ref by value is the correct pattern here.
 
-#include "cuHLL/cuda_check.hpp"
-#include "cuHLL/kmer_kernel.cuh"
-#include "cuHLL/nthash.cuh"
-#include "cuHLL/nvtx_util.hpp"
+#include "cuHLL/common/cuda_check.hpp"
+#include "cuHLL/kmer/kmer_kernel.cuh"
+#include "cuHLL/kmer/nthash.cuh"
+#include "cuHLL/common/nvtx_util.hpp"
 
 #include <cuda_runtime.h>
 

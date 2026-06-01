@@ -1,4 +1,4 @@
-#include "cuHLL/concurrent.hpp"
+#include "cuHLL/pipeline/concurrent.hpp"
 
 #include <algorithm>
 #include <cctype>

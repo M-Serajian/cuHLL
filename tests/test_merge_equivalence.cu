@@ -13,9 +13,9 @@
 // expected to be bit-identical in practice.
 // =============================================================================
 
-#include "cuHLL/hll_file.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/io/hll_file.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 #include "test_common.hpp"
 
 #include <cmath>

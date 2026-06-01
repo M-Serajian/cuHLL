@@ -1,4 +1,4 @@
-#include "cuHLL/hll_file.hpp"
+#include "cuHLL/io/hll_file.hpp"
 
 #include <cerrno>
 #include <cstdio>

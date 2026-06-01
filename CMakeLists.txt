@@ -556,7 +556,7 @@ CPMAddPackage(
 )
 
 find_package(CUDAToolkit REQUIRED)
-# zlib for transparent FASTA/FASTQ + .gz reading in src/fasta.cpp.
+# zlib for transparent FASTA/FASTQ + .gz reading in src/io/fasta.cpp.
 find_package(ZLIB REQUIRED)
 
 # -----------------------------------------------------------------------------
@@ -569,7 +569,7 @@ find_package(ZLIB REQUIRED)
 #   - The link against CUDA::cudart works
 #   - The final binary loads on an L4 (sm_89) without ptxas / loader errors
 # Real `cuhll_core`, `cuhll_gpu`, and `cuhll` targets land in later milestones.
-add_executable(cuco_probe src/cuco_probe.cu)
+add_executable(cuco_probe src/probes/cuco_probe.cu)
 target_include_directories(cuco_probe PRIVATE include)
 target_link_libraries(cuco_probe PRIVATE cuco::cuco CUDA::cudart)
 
@@ -600,13 +600,14 @@ endif()
 # recompiling each source from scratch.
 # -----------------------------------------------------------------------------
 add_library(cuhll_core STATIC
-    src/fasta.cpp
-    src/sketch.cu
-    src/kmer_kernel.cu
-    src/hll_file.cpp
-    src/pipeline.cu
-    src/concurrent.cpp
-    src/pipeline_concurrent.cu
+    src/io/fasta.cpp
+    src/io/hll_file.cpp
+    src/sketch/sketch.cu
+    src/kmer/kmer_kernel.cu
+    src/pipeline/pipeline.cu
+    src/pipeline/concurrent.cpp
+    src/pipeline/pipeline_concurrent.cu
+    src/pairwise/pairwise.cu
 )
 target_include_directories(cuhll_core PUBLIC include)
 target_link_libraries(cuhll_core PUBLIC cuco::cuco CUDA::cudart ZLIB::ZLIB)
@@ -624,13 +625,27 @@ target_compile_options(cuhll_core PRIVATE
 # -----------------------------------------------------------------------------
 # cuhll executable. main.cpp is plain C++; the CUDA TUs live in cuhll_core.
 # -----------------------------------------------------------------------------
-add_executable(cuhll src/main.cpp)
+add_executable(cuhll src/apps/cuhll.cpp)
 target_link_libraries(cuhll PRIVATE cuhll_core)
 set_target_properties(cuhll PROPERTIES
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
 )
 if(CUHLL_STATIC_LIBSTDCXX)
     target_link_options(cuhll PRIVATE -static-libstdc++ -static-libgcc)
+endif()
+
+# -----------------------------------------------------------------------------
+# cuhll_pairwise executable. Loads .hll sketches produced by `cuhll`'s
+# --output-dir / --keep-sketches modes and computes all-pairs Jaccard via
+# the two-stage filter+refine pipeline (see src/pairwise/pairwise.cu).
+# -----------------------------------------------------------------------------
+add_executable(cuhll_pairwise src/apps/cuhll_pairwise.cpp)
+target_link_libraries(cuhll_pairwise PRIVATE cuhll_core)
+set_target_properties(cuhll_pairwise PROPERTIES
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+)
+if(CUHLL_STATIC_LIBSTDCXX)
+    target_link_options(cuhll_pairwise PRIVATE -static-libstdc++ -static-libgcc)
 endif()
 
 # -----------------------------------------------------------------------------

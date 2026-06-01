@@ -11,7 +11,7 @@
 // needing multiple real GPUs.
 // =============================================================================
 
-#include "cuHLL/concurrent.hpp"
+#include "cuHLL/pipeline/concurrent.hpp"
 
 #include <cstdint>
 #include <cstdio>

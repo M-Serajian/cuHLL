@@ -30,9 +30,10 @@ cd cuHLL
 pip install .
 ```
 
-This builds the C++/CUDA library, the Python bindings, and the `cuhll`
-CLI binary all at once. After it finishes, `import cuhll` works and
-the CLI is at `build/<wheel-tag>/bin/cuhll`.
+This builds the C++/CUDA library, the Python bindings, and both CLI
+binaries (`cuhll` for sketching, `cuhll_pairwise` for all-pairs Jaccard)
+all at once. After it finishes, `import cuhll` works and the CLIs are at
+`build/<wheel-tag>/bin/`.
 
 To confirm everything is wired up, run the demo:
 
@@ -56,7 +57,9 @@ cmake ..
 cmake --build . -j
 ```
 
-Output binaries land in `build/bin/cuhll` and `build/bin/cuco_probe`.
+Output binaries land in `build/bin/`: `cuhll` (sketching),
+`cuhll_pairwise` (all-pairs Jaccard between saved sketches), and
+`cuco_probe` (cuco / GPU sanity check).
 Common flags:
 
 ```bash
@@ -99,6 +102,24 @@ gzipped — the format is detected from the file's contents, not its
 name. Default precision is 14 (about 0.81% relative error), and k-mers
 are canonical by default (a k-mer and its reverse complement count as
 the same thing).
+
+### All-pairs Jaccard between saved sketches
+
+Once you have a directory of per-genome `.hll` files (from `--output-dir`
+or `--keep-sketches`), `cuhll_pairwise` computes the exact 16K-register
+HLL Jaccard for every pair on the GPU.
+
+```bash
+# Step 1 — sketches to disk
+cuhll --k 31 --list manifest.txt --output-dir sketches/
+
+# Step 2 — pairwise Jaccard (TSV: path_i \t path_j \t jaccard)
+cuhll_pairwise --sketches-dir sketches/ --threshold 0.5 > pairs.tsv
+```
+
+The `--threshold` flag only controls which pairs are *emitted* to the
+output — every pair is still computed (pairs below the threshold are
+dropped to keep the output manageable on large N).
 
 ## Python API
 

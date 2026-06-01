@@ -1,9 +1,9 @@
 // sketch.cu — definitions for the host-facing Sketch class declared in
 // sketch.hpp, backed by cuco::hyperloglog under the hood.
 
-#include "cuHLL/cuda_check.hpp"
-#include "cuHLL/sketch.hpp"
-#include "cuHLL/sketch_internal.cuh"
+#include "cuHLL/common/cuda_check.hpp"
+#include "cuHLL/sketch/sketch.hpp"
+#include "cuHLL/sketch/sketch_internal.cuh"
 
 namespace cuhll {
 

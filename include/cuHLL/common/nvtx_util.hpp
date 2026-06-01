@@ -1,8 +1,12 @@
 #pragma once
-// RAII NVTX range markers, scoped to a cuhll-specific domain so traces
-// don't mix with whatever cuco / CCCL emit. The whole thing compiles
-// down to nothing when CUHLL_NVTX is undefined — useful for slim builds
-// or platforms without the NVTX runtime.
+// RAII NVTX range markers in a cuHLL-specific NVTX domain.
+//
+// Macros:
+//   CUHLL_NVTX_RANGE(label)   — open a scoped range that closes at end of scope
+//   CUHLL_NVTX_MARK(label)    — emit a point marker
+//
+// Both compile to no-ops when CUHLL_NVTX is undefined, so NVTX is optional
+// at build time.
 
 #ifdef CUHLL_NVTX
 #include <nvtx3/nvtx3.hpp>

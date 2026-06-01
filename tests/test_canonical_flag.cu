@@ -10,9 +10,9 @@
 //  E. Back-compat: an existing milestone-k v1 .hll loads as canonical.
 // =============================================================================
 
-#include "cuHLL/hll_file.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/io/hll_file.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 #include "test_common.hpp"
 
 #include <cmath>

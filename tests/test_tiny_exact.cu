@@ -22,11 +22,11 @@
 // Run at both k=21 and k=31.
 // =============================================================================
 
-#include "cuHLL/common.hpp"
+#include "cuHLL/common/common.hpp"
 #include "test_common.hpp"
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/pipeline.hpp"
-#include "cuHLL/sketch.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/pipeline/pipeline.hpp"
+#include "cuHLL/sketch/sketch.hpp"
 
 #include <cmath>
 #include <cstdint>

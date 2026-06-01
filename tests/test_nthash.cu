@@ -16,8 +16,8 @@
 // bench/results/nthash_ground_truth.txt as a regression record.
 // =============================================================================
 
-#include "cuHLL/cuda_check.hpp"
-#include "cuHLL/nthash.cuh"
+#include "cuHLL/common/cuda_check.hpp"
+#include "cuHLL/kmer/nthash.cuh"
 
 #include <cuda_runtime.h>
 

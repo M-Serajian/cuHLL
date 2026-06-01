@@ -1,5 +1,5 @@
-#include "cuHLL/fasta.hpp"
-#include "cuHLL/nvtx_util.hpp"
+#include "cuHLL/io/fasta.hpp"
+#include "cuHLL/common/nvtx_util.hpp"
 
 #include <algorithm>
 #include <cerrno>
