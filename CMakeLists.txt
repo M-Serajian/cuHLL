@@ -557,7 +557,50 @@ CPMAddPackage(
 
 find_package(CUDAToolkit REQUIRED)
 # zlib for transparent FASTA/FASTQ + .gz reading in src/io/fasta.cpp.
+# (Still used by the streaming FastaChunkReader's incremental reads.)
 find_package(ZLIB REQUIRED)
+
+# libdeflate: ~2x faster gzip inflate than zlib for the eager whole-file
+# decode path (slurp_gzip). The genomic input pipeline is decompression-
+# bound (measured: an L4 sits at ~6% util while 14 zlib readers feed it),
+# so a faster serial decoder directly halves wall time. Optional: if the
+# CPM fetch is unavailable the code falls back to the zlib path.
+option(CUHLL_USE_LIBDEFLATE "Use libdeflate for faster gzip decode (falls back to zlib if OFF/unavailable)" ON)
+set(CUHLL_HAVE_LIBDEFLATE OFF)
+if(CUHLL_USE_LIBDEFLATE)
+    CPMAddPackage(
+        NAME libdeflate
+        GITHUB_REPOSITORY ebiggers/libdeflate
+        GIT_TAG v1.19
+        OPTIONS
+          "LIBDEFLATE_BUILD_SHARED_LIB OFF"
+          "LIBDEFLATE_BUILD_GZIP OFF"
+          "LIBDEFLATE_BUILD_TESTS OFF"
+    )
+    if(TARGET libdeflate::libdeflate_static OR TARGET libdeflate_static)
+        set(CUHLL_HAVE_LIBDEFLATE ON)
+        message(STATUS "cuHLL: using libdeflate for gzip decode")
+    else()
+        message(WARNING "cuHLL: libdeflate not available; falling back to zlib gzip decode")
+    endif()
+endif()
+
+# zstd: optional support for zstd-compressed inputs (*.zst). zstd decodes
+# ~3-5x faster than gzip, so it's the recommended format for a decompression-
+# bound pipeline. Uses the system libzstd if present; if not found, .zst
+# inputs are simply rejected with a clear error (gzip/plain unaffected).
+option(CUHLL_USE_ZSTD "Support zstd-compressed inputs via system libzstd" ON)
+set(CUHLL_HAVE_ZSTD OFF)
+if(CUHLL_USE_ZSTD)
+    find_path(ZSTD_INCLUDE_DIR zstd.h)
+    find_library(ZSTD_LIBRARY NAMES zstd)
+    if(ZSTD_INCLUDE_DIR AND ZSTD_LIBRARY)
+        set(CUHLL_HAVE_ZSTD ON)
+        message(STATUS "cuHLL: using libzstd for .zst inputs (${ZSTD_LIBRARY})")
+    else()
+        message(STATUS "cuHLL: libzstd not found; .zst inputs will be rejected")
+    endif()
+endif()
 
 # -----------------------------------------------------------------------------
 # Milestone (a) probe target
@@ -611,6 +654,19 @@ add_library(cuhll_core STATIC
 )
 target_include_directories(cuhll_core PUBLIC include)
 target_link_libraries(cuhll_core PUBLIC cuco::cuco CUDA::cudart ZLIB::ZLIB)
+if(CUHLL_HAVE_LIBDEFLATE)
+    if(TARGET libdeflate::libdeflate_static)
+        target_link_libraries(cuhll_core PUBLIC libdeflate::libdeflate_static)
+    else()
+        target_link_libraries(cuhll_core PUBLIC libdeflate_static)
+    endif()
+    target_compile_definitions(cuhll_core PUBLIC CUHLL_HAVE_LIBDEFLATE)
+endif()
+if(CUHLL_HAVE_ZSTD)
+    target_include_directories(cuhll_core PUBLIC ${ZSTD_INCLUDE_DIR})
+    target_link_libraries(cuhll_core PUBLIC ${ZSTD_LIBRARY})
+    target_compile_definitions(cuhll_core PUBLIC CUHLL_HAVE_ZSTD)
+endif()
 set_target_properties(cuhll_core PROPERTIES
     CUDA_SEPARABLE_COMPILATION ON
     POSITION_INDEPENDENT_CODE ON

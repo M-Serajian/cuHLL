@@ -42,13 +42,14 @@ std::string lower(std::string s) {
     return s;
 }
 
-// Strip a trailing ".gz" (case-insensitive) and return the inner extension.
-// e.g. "/path/to/foo.fastq.gz" → ".fastq". For non-gzipped paths the
-// path's own extension is returned.
+// Strip a trailing compression extension (".gz" or ".zst", case-insensitive)
+// and return the inner extension. e.g. "/path/to/foo.fastq.gz" → ".fastq",
+// "foo.fasta.zst" → ".fasta". For uncompressed paths the path's own
+// extension is returned.
 std::string sequence_inner_ext(const std::string& p) {
     std::filesystem::path pp(p);
     const auto outer = lower(pp.extension().string());
-    if (outer == ".gz") {
+    if (outer == ".gz" || outer == ".zst") {
         return lower(std::filesystem::path(pp.stem()).extension().string());
     }
     return outer;
@@ -66,7 +67,7 @@ std::string validate_input(const std::string& path) {
     if (!has_sequence_ext(path)) {
         throw std::runtime_error(
             "unknown input extension (expected .fasta/.fa/.fna/.fastq/.fq, "
-            "optionally with .gz): " + path);
+            "optionally with .gz or .zst): " + path);
     }
     return path;
 }
@@ -159,8 +160,8 @@ void print_usage(const char* prog) {
         "usage: %s --k <K> [options] <input> [<input> ...]\n"
         "\n"
         "Inputs: FASTA or FASTQ (*.fasta / *.fa / *.fna / *.fastq / *.fq),\n"
-        "        optionally gzip-compressed (*.gz). Format is auto-detected\n"
-        "        from the gzip magic bytes and the first content byte.\n"
+        "        optionally compressed with gzip (*.gz) or zstd (*.zst).\n"
+        "        Format is auto-detected from magic bytes / first content byte.\n"
         "\n"
         "Options:\n"
         "  --k            k-mer length (required; %d <= k <= %d)\n"

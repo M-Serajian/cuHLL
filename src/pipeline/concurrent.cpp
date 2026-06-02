@@ -26,13 +26,19 @@ namespace cuhll {
 // shared 4× upper bound so the per-stream pinned buffer is big enough
 // for either format without inspecting the file's content.
 constexpr std::size_t kGzipInflationFactor = 4;
+// zstd compresses better than gzip, so the same content yields a smaller file
+// — i.e. it expands more on decode. Use a larger upper-bound factor so the
+// per-stream buffer is big enough for the parsed bases of a .zst input.
+constexpr std::size_t kZstdInflationFactor = 8;
 
-static bool path_is_gzip(const std::string& p) {
-    if (p.size() < 3) return false;
-    auto e = p.substr(p.size() - 3);
+static bool path_has_suffix(const std::string& p, const std::string& suf) {
+    if (p.size() < suf.size()) return false;
+    auto e = p.substr(p.size() - suf.size());
     for (auto& c : e) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    return e == ".gz";
+    return e == suf;
 }
+static bool path_is_gzip(const std::string& p) { return path_has_suffix(p, ".gz"); }
+static bool path_is_zstd(const std::string& p) { return path_has_suffix(p, ".zst"); }
 
 InputSurvey survey_inputs(const std::vector<std::string>& paths) {
     InputSurvey s;
@@ -48,7 +54,8 @@ InputSurvey survey_inputs(const std::vector<std::string>& paths) {
                                      + p + ": " + std::strerror(errno));
         }
         std::size_t sz = static_cast<std::size_t>(st.st_size);
-        if (path_is_gzip(p)) sz *= kGzipInflationFactor;
+        if (path_is_gzip(p))      sz *= kGzipInflationFactor;
+        else if (path_is_zstd(p)) sz *= kZstdInflationFactor;
         sizes.push_back(sz);
         s.bytes_total += sz;
         if (sz > s.bytes_max) s.bytes_max = sz;

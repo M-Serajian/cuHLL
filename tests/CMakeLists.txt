@@ -60,6 +60,17 @@ add_test(NAME test_auto_tune
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # ----------------------------------------------------------------------
+# test_fasta_stream — pure C++, no GPU or FASTA fixture needed. Proves the
+# streaming FastaChunkReader matches the eager reader across FASTA/FASTQ
+# and plain/gzip inputs (generates its own data via zlib).
+# ----------------------------------------------------------------------
+add_executable(test_fasta_stream test_fasta_stream.cpp)
+target_link_libraries(test_fasta_stream PRIVATE cuhll_core)
+add_test(NAME test_fasta_stream
+         COMMAND test_fasta_stream
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ----------------------------------------------------------------------
 # test_against_kmc (Layer 2) — cross-implementation validation against
 # KMC3's exact distinct-k-mer count.
 #

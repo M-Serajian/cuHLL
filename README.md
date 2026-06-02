@@ -1,7 +1,7 @@
 # 🧬 cuHLL
 
 A GPU implementation of HyperLogLog for counting distinct k-mers in
-FASTA or FASTQ files (gzip is fine). Builds and merges sketches on the
+FASTA or FASTQ files (gzip and zstd are fine). Builds and merges sketches on the
 GPU, writes them to `.hll` files, and lets you query them later from
 either Python or C++.
 
@@ -15,7 +15,9 @@ either Python or C++.
 | GCC / G++ | 11 | build-time; `module load gcc/14.2.0` on HPC |
 | Python | 3.9 | for the Python package; use system Python or a venv |
 | CMake | 4.0 | auto-fetched by the pip build env |
-| zlib | any modern version | distro package; needed for `.gz` reading |
+| zlib | any modern version | distro package; `.gz` streaming reader + fallback decode |
+| libdeflate | auto-fetched (CPM) | faster `.gz` decode (~2× zlib); opt out with `-DCUHLL_USE_LIBDEFLATE=OFF` |
+| libzstd | system (optional) | enables `.zst` inputs (~3–5× faster decode than gzip); opt out with `-DCUHLL_USE_ZSTD=OFF` |
 | Linux x86_64 | RHEL 9 / Ubuntu 20.04+ tested | other distros likely fine |
 
 ## Install
@@ -98,8 +100,9 @@ cuhll --help                                  # all flags
 ```
 
 Inputs can be `.fasta`, `.fa`, `.fna`, `.fastq`, or `.fq`, optionally
-gzipped — the format is detected from the file's contents, not its
-name. Default precision is 14 (about 0.81% relative error), and k-mers
+compressed with gzip (`.gz`) or zstd (`.zst`) — the format is detected from
+the file's contents, not its name. Default precision is 14 (about 0.81%
+relative error), and k-mers
 are canonical by default (a k-mer and its reverse complement count as
 the same thing).
 

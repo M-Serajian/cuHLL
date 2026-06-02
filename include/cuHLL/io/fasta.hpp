@@ -15,14 +15,15 @@
 //       are handled by the same call.
 //
 //   FastaChunkReader (class below)
-//       Streaming chunk-by-chunk reader for plain (non-gzipped) FASTA.
-//       Used by the streaming pipeline so the input doesn't have to fit
-//       in host RAM. Headers are stripped, whitespace removed, and the
-//       last few bytes of each chunk are carried into the next chunk so
-//       k-mers crossing chunk boundaries are not lost.
+//       Streaming chunk-by-chunk reader for FASTA, FASTQ, and gzipped
+//       variants of both (format auto-detected from the first content
+//       byte; gzip detected transparently by zlib). Used by the streaming
+//       pipeline so the input doesn't have to fit in host RAM. Headers are
+//       stripped, whitespace removed, and the last few bytes of each chunk
+//       are carried into the next chunk so k-mers crossing chunk boundaries
+//       are not lost.
 
 #include <cstddef>
-#include <fstream>
 #include <string>
 #include <vector>
 
@@ -39,6 +40,11 @@ std::size_t read_fasta_into(const std::string& path, char* dst,
 class FastaChunkReader {
 public:
     explicit FastaChunkReader(const std::string& path);
+    ~FastaChunkReader();
+
+    // Owns a zlib handle; not copyable.
+    FastaChunkReader(const FastaChunkReader&)            = delete;
+    FastaChunkReader& operator=(const FastaChunkReader&) = delete;
 
     // Fill `dst` with up to `cap` bytes of parsed sequence content.
     //
@@ -63,15 +69,27 @@ public:
 private:
     void refill_raw();
 
-    std::ifstream        fin_;
+    // Opaque zlib gzFile handle (void* keeps <zlib.h> out of this header).
+    // Reads plain and gzip inputs transparently.
+    void*                gzf_       = nullptr;
     std::vector<char>    raw_buf_;
     std::size_t          raw_pos_   = 0;
     std::size_t          raw_len_   = 0;
     bool                 raw_eof_   = false;
     bool                 eof_       = false;
 
+    // Sequence format, auto-detected from the first content byte.
+    enum Format { kFmtUnknown = 0, kFmtFasta, kFmtFastq };
+    Format               format_    = kFmtUnknown;
+
+    // FASTA parse state.
     bool                 in_header_          = false;
     bool                 first_record_seen_  = false;
+
+    // FASTQ parse state: line within the 4-line record (0=header, 1=seq,
+    // 2='+', 3=quality) and whether the next seq line is the first one.
+    int                  fq_line_      = 0;
+    bool                 fq_first_seq_ = true;
 
     // Holds the trailing bytes of the previous emit so the next call can
     // start with them. Grows to the largest overlap requested so far.
