@@ -579,6 +579,15 @@ if(CUHLL_USE_LIBDEFLATE)
     )
     if(TARGET libdeflate::libdeflate_static OR TARGET libdeflate_static)
         set(CUHLL_HAVE_LIBDEFLATE ON)
+        # libdeflate's CMake builds the static lib without -fPIC. That's fine
+        # for the executables, but the Python bindings are a shared object
+        # (-shared), and linking non-PIC objects into a .so fails with
+        # "relocation R_X86_64_32 ... can not be used when making a shared
+        # object". Force PIC on the static target so it can be linked into both.
+        if(TARGET libdeflate_static)
+            set_target_properties(libdeflate_static PROPERTIES
+                POSITION_INDEPENDENT_CODE ON)
+        endif()
         message(STATUS "cuHLL: using libdeflate for gzip decode")
     else()
         message(WARNING "cuHLL: libdeflate not available; falling back to zlib gzip decode")
