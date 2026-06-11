@@ -660,6 +660,12 @@ add_library(cuhll_core STATIC
     src/pipeline/concurrent.cpp
     src/pipeline/pipeline_concurrent.cu
     src/pairwise/pairwise.cu
+    # K-mer abundance k-mer sidecar. Always part of cuhll_core (so it ships
+    # with every build, including the Python wheel); opt-in at runtime via the
+    # CUHLL_ABUNDANCE environment variable. The abundance pass never touches the HLL
+    # sketch, so F0 is unaffected when it is disabled.
+    src/abundance/abundance_sketch.cu
+    src/abundance/abundance_pipeline.cu
 )
 target_include_directories(cuhll_core PUBLIC include)
 target_link_libraries(cuhll_core PUBLIC cuco::cuco CUDA::cudart ZLIB::ZLIB)

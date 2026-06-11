@@ -13,6 +13,11 @@
 #include "cuHLL/sketch/sketch.hpp"
 #include "cuHLL/sketch/sketch_internal.cuh"
 
+// K-mer abundance sidecar: always compiled into cuhll_core, opt-in at
+// runtime via cuhll::abundance::enabled(). The abundance pass never touches the HLL
+// sketch, so F0 is unaffected.
+#include "cuHLL/abundance/abundance_pipeline.cuh"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -379,6 +384,13 @@ std::uint64_t sketch_per_genome_auto(
                                  k, ref, sl.stream,
                                  sl.sketch->canonical());
         }
+        // Additive abundance pass over the SAME device buffer (own kernel; does not
+        // touch the HLL sketch, so F0 is unaffected). Opt-in at runtime.
+        if (cuhll::abundance::enabled() && n >= static_cast<std::size_t>(k)) {
+            cuhll::abundance::on_stream(static_cast<const char*>(sl.d_input),
+                                   static_cast<std::int64_t>(n), k,
+                                   sl.sketch->canonical(), sl.stream);
+        }
         const void* d_regs = sl.sketch->impl_ref().sketch.sketch().data();
         CUDA_CHECK(cudaMemcpyAsync(sl.h_regs, d_regs, reg_bytes,
                                    cudaMemcpyDeviceToHost, sl.stream));
@@ -391,6 +403,8 @@ std::uint64_t sketch_per_genome_auto(
         sl.in_flight_pinned  = use_pinned ? pg.pinned_buf : nullptr;
         ++n_launched;
     };
+
+    if (cuhll::abundance::enabled()) cuhll::abundance::reset();
 
     const std::size_t target = fasta_paths.size();
 
@@ -453,6 +467,15 @@ std::uint64_t sketch_per_genome_auto(
         Sketch union_sketch(precision_p, canonical);
         union_sketch.load_registers_from_host(union_regs.data());
         union_est = union_sketch.estimate();
+        if (cuhll::abundance::enabled()) {
+            std::uint64_t bnd_distinct = 0, bnd_occ = 0, bnd_S = 0;
+            const std::uint64_t bnd_tau =
+                cuhll::abundance::finalize_tau(bnd_distinct, bnd_occ, bnd_S);
+            std::fprintf(stderr,
+                "[cuHLL abundance] S=%llu tau=%llu distinct=%llu occ=%llu\n",
+                (unsigned long long)bnd_S, (unsigned long long)bnd_tau,
+                (unsigned long long)bnd_distinct, (unsigned long long)bnd_occ);
+        }
     } catch (...) {
         teardown();
         throw;

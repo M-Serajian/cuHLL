@@ -71,6 +71,43 @@ add_test(NAME test_fasta_stream
          WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # ----------------------------------------------------------------------
+# K-mer abundance sidecar tests. The .cu tests link cuhll_core (which
+# now contains the abundance kernels) and run on a GPU; all use the shared
+# abundance_test_common.hpp from this directory.
+# ----------------------------------------------------------------------
+set(_abundance_gpu_tests
+    test_abundance_sketch      # streaming sketch == two-pass oracle (bit-identical)
+    test_abundance_tau         # bottom-k tau extraction
+    test_abundance_count       # saturating counting table
+    test_abundance_estimate    # abundance estimate + 99% CI coverage
+    test_abundance_ci          # Clopper-Pearson / split-delta interval
+    test_abundance_oracle      # CPU oracle on tiny inputs
+)
+foreach(t IN LISTS _abundance_gpu_tests)
+    add_executable(${t} ${t}.cu)
+    target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(${t} PRIVATE cuhll_core)
+    set_target_properties(${t} PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    )
+    add_test(NAME ${t}
+             COMMAND ${t}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(${t} PROPERTIES
+        SKIP_REGULAR_EXPRESSION "${_cuhll_skip_regex}")
+endforeach()
+
+# test_abundance_statistics — pure C++ (incomplete beta / Clopper-Pearson vs scipy),
+# no GPU. Header-only; needs only the abundance headers + abundance_test_common.hpp.
+add_executable(test_abundance_statistics test_abundance_statistics.cpp)
+target_include_directories(test_abundance_statistics
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME test_abundance_statistics
+         COMMAND test_abundance_statistics
+         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+# ----------------------------------------------------------------------
 # test_against_kmc (Layer 2) — cross-implementation validation against
 # KMC3's exact distinct-k-mer count.
 #
